@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "SoftSeg"
-version = "0.0.1"
+version = "0.0.2"
 authors = [
   { name="Cecilia Cisar", email="ccisar@ucsc.edu" },
 ]
@@ -15,4 +15,15 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
+]
+dependencies = [
+    "anndata",
+    "cv2",
+    "matplotlib",
+    "seaborn",
+    "numpy",
+    "pandas",
+    "psutil", # is this one really needed?
+    "scanpy",
+    "skimage"
 ]
