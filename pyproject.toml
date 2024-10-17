@@ -10,7 +10,7 @@ authors = [
 ]
 description = "A small example package"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = "3.8"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -26,9 +26,5 @@ dependencies = [
     "pathspec>=0.10.1",
     "psutil", # is this one really needed?
     "scanpy",
-    "scikit-image",
-    "numba<=0.58.1",
-    "pillow<=10.4.0",
-    "statsmodels<=0.14.1",
-    "llvmlite<=0.41.1"
+    "scikit-image"
 ]
