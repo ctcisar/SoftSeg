@@ -27,5 +27,8 @@ dependencies = [
     "psutil", # is this one really needed?
     "scanpy",
     "scikit-image",
-    "kiwisolver<=1.4.7"
+    "numba<=0.58.1",
+    "pillow<=10.4.0",
+    "statsmodels<=0.14.1",
+    "llvmlite<=0.41.1"
 ]
