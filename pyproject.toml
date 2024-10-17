@@ -23,6 +23,7 @@ dependencies = [
     "seaborn",
     "numpy",
     "pandas",
+    "pathspec>=0.10.1",
     "psutil", # is this one really needed?
     "scanpy",
     "scikit-image"
