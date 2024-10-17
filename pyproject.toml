@@ -25,5 +25,5 @@ dependencies = [
     "pandas",
     "psutil", # is this one really needed?
     "scanpy",
-    "skimage"
+    "scikit-image"
 ]
