@@ -18,13 +18,13 @@ classifiers = [
 ]
 dependencies = [
     "anndata",
-    "opencv-python<=4.10",
+    "opencv-python",
     "matplotlib",
     "seaborn",
     "numpy",
     "pandas",
     "pathspec>=0.10.1",
     "psutil", # is this one really needed?
-    "scanpy",
+    "scanpy<=1.9.8",
     "scikit-image"
 ]
