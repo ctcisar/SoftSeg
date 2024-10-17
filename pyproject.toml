@@ -25,6 +25,6 @@ dependencies = [
     "pandas",
     "pathspec>=0.10.1",
     "psutil", # is this one really needed?
-    "scanpy<=1.9.8",
-    "scikit-image"
+    "scanpy",
+    "scikit-image<=0.21.0"
 ]
