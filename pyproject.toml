@@ -26,5 +26,6 @@ dependencies = [
     "pathspec>=0.10.1",
     "psutil", # is this one really needed?
     "scanpy",
-    "scikit-image<=0.21.0"
+    "scikit-image",
+    "kiwisolver<=1.4.7"
 ]
