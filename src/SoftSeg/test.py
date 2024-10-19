@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import random
 
 
 def test():
@@ -6,4 +7,11 @@ def test():
     im = ax.scatter(range(100), range(100))
     ax.set_xlabel("whateverrrr")
     fig.colorbar(im, ax=ax)
+    plt.show(block=False)
+
+    for i in range(10**1000):
+        random.random()
+        if i % 100 == 0:
+            print(i)
+
     plt.show()

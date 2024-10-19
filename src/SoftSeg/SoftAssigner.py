@@ -2,6 +2,7 @@ import parse
 import glob
 import logging
 import time
+import ast
 from datetime import datetime
 from itertools import repeat
 from multiprocessing import Pool
@@ -230,7 +231,6 @@ class SoftAssigner:
         full_tr.to_csv(f"{self.complete_loc}all_soft_cellids.csv", index=False)
 
     def calculate_confident_threshold(self):
-"""
         tr_tally = len(full_tr)
         max_ass_est = 5
         cutoffs = np.empty((tr_tally, max_ass_est))
@@ -295,4 +295,3 @@ class SoftAssigner:
         print(
             f"{fir}\nFirst overlap happens at {rang[fir]}, \n\t{assigned_tr[fir]} transcripts assigned\n\t{dupe_tr[fir]} assigned to more than one cell\n\t{dupe_tr[fir]/assigned_tr[fir]*100:.5f}% assigned to more than one cell."
         )
-        """
