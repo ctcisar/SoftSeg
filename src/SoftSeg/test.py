@@ -15,7 +15,7 @@ def test():
     fig.colorbar(im, ax=ax)
     plt.show(block=False)
 
-    for i in range(10**10):
+    for i in range(10**5):
         random.random()
         if i % 100 == 0:
             print(i)

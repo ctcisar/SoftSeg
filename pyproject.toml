@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "SoftSeg"
-version = "0.0.2"
+version = "0.0.3"
 authors = [
   { name="Cecilia Cisar", email="ccisar@ucsc.edu" },
 ]
@@ -25,7 +25,6 @@ dependencies = [
     "pandas",
     "parse",
     "pathspec>=0.10.1",
-    "psutil", # is this one really needed?
     "scanpy",
     "scikit-image"
 ]
