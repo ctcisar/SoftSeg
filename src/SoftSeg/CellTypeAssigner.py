@@ -2,7 +2,7 @@ import urllib.request
 from collections import Counter
 
 import anndata as ad
-import maplotlib.pyplot as plt
+import matplotlib.pyplot as plt
 import matplotlib
 import numpy as np
 import pandas as pd
