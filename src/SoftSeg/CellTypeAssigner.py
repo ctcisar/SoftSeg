@@ -1,19 +1,26 @@
-import urllib.request
 from collections import Counter
 
 import anndata as ad
-import matplotlib.pyplot as plt
 import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import requests
 import scanpy as sc
+from clint.textui import progress
 
 
 def download_lung_dataset(filename):
-    urllib.request.urlretrieve(
-        "https://datasets.cellxgene.cziscience.com/b351804c-293e-4aeb-9c4c-043db67f4540.h5ad",
-        filename,
-    )
+    url = "https://datasets.cellxgene.cziscience.com/b351804c-293e-4aeb-9c4c-043db67f4540.h5ad"
+    r = requests.get(url, stream=True)
+    with open(filename, "wb") as f:
+        total_length = int(r.headers.get("content-length"))
+        for chunk in progress.bar(
+            r.iter_content(chunk_size=1024), expected_size=(total_length / 1024) + 1
+        ):
+            if chunk:
+                f.write(chunk)
+                f.flush()
 
 
 class CellTypeAssigner:

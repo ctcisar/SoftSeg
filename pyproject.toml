@@ -18,6 +18,7 @@ classifiers = [
 ]
 dependencies = [
     "anndata",
+    "clint",
     "opencv-python",
     "matplotlib",
     "seaborn",
