@@ -1,15 +1,19 @@
+import urllib.request
+from collections import Counter
+
 import anndata as ad
-import Counter
 import maplotlib.pyplot as plt
 import matplotlib
 import numpy as np
 import pandas as pd
 import scanpy as sc
-import urllib.request
 
 
 def download_lung_dataset(filename):
-    urllib.request.urlretrieve('https://datasets.cellxgene.cziscience.com/b351804c-293e-4aeb-9c4c-043db67f4540.h5ad', filename)
+    urllib.request.urlretrieve(
+        "https://datasets.cellxgene.cziscience.com/b351804c-293e-4aeb-9c4c-043db67f4540.h5ad",
+        filename,
+    )
 
 
 class CellTypeAssigner:
