@@ -1,3 +1,4 @@
+from tqdm import tqdm
 from collections import Counter
 
 import anndata as ad
@@ -7,21 +8,25 @@ import numpy as np
 import pandas as pd
 import requests
 import scanpy as sc
-from clint.textui import progress
 
 
-def download_lung_dataset(filename):
+def download_lung_dataset(filepath):
     url = "https://datasets.cellxgene.cziscience.com/b351804c-293e-4aeb-9c4c-043db67f4540.h5ad"
-    r = requests.get(url, stream=True)
-    with open(filename, "wb") as f:
-        total_length = int(r.headers.get("content-length"))
-        for chunk in progress.bar(
-            r.iter_content(chunk_size=1024), expected_size=(total_length / 1024) + 1
-        ):
-            if chunk:
-                f.write(chunk)
-                f.flush()
+    # Streaming, so we can iterate over the response.
+    response = requests.get(url, stream=True)
 
+    # Sizes in bytes.
+    total_size = int(response.headers.get("content-length", 0))
+    block_size = 1024
+
+    with tqdm(total=total_size, unit="B", unit_scale=True) as progress_bar:
+        with open(filepath, "wb") as file:
+            for data in response.iter_content(block_size):
+                progress_bar.update(len(data))
+                file.write(data)
+
+    if total_size != 0 and progress_bar.n != total_size:
+        raise RuntimeError("Could not download file")
 
 class CellTypeAssigner:
     def __init__(self, adata_loc=None, adata=None, verbose=True):
