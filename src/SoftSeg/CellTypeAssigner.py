@@ -28,6 +28,7 @@ def download_lung_dataset(filepath):
     if total_size != 0 and progress_bar.n != total_size:
         raise RuntimeError("Could not download file")
 
+
 class CellTypeAssigner:
     def __init__(self, adata_loc=None, adata=None, verbose=True):
         if adata is not None:

@@ -26,6 +26,7 @@ from matplotlib.patches import Circle
 from skimage.measure import regionprops
 from skimage.segmentation import clear_border
 
+
 loc = "/media/cecilia/Data/vizgen/LungCancerPatient1/"
 loc_compl = "/media/cecilia/Data/vizgen/LungCancerPatient1/nickcomp_3/"
 tr_st = f"{loc}fov_{{:04}}_selected_transcripts.csv"
