@@ -640,10 +640,11 @@ class SoftAssigner:
                         temp = []
                         if k[v] in conf_tr.keys():
                             for gene in conf_tr[k[v]]:
-                                t = self.df_comp[gene].copy()
-                                t = t.loc[types]
-                                # t.name = f"{gene}_{types[l]}"
-                                temp.append(t)
+                                if gene in self.df_comp.columns:
+                                    t = self.df_comp[gene].copy()
+                                    t = t.loc[types]
+                                    # t.name = f"{gene}_{types[l]}"
+                                    temp.append(t)
                             conf_inds.append(pd.concat(temp, axis=1))
                         else:
                             conf_inds.append([])
@@ -669,30 +670,33 @@ class SoftAssigner:
                             reass_inds[inds] = []
                             # print(f"{inds} all genes: {genes}")
                             for gene, index in genes:
-                                # if this has been reassigned elsewhere, go with that
-                                if index in all_reass.keys():
-                                    c = all_reass[index]
-                                    cell_ind = [
-                                        ks for ks in range(len(k)) if k[ks] == c
-                                    ]
-                                    if len(cell_ind) != 1:
-                                        print(
-                                            f"Warning! Gene {index} has been assigned to {all_reass[index]}, which is not one of the eligible cells in this comparison!"
-                                        )
-                                        continue
-                                    temp = self.df_comp[gene].copy()
-                                    temp = temp.loc[types]
-                                    if len(conf_inds[cell_ind[0]]) > "0":
-                                        conf_inds[cell_ind[0]] = pd.concat(
-                                            [conf_inds[cell_ind[0]], temp], axis=1
-                                        )
+                                if (
+                                    gene in self.df_comp.columns
+                                ):  # possible for genes to get dropped in filtering
+                                    # if this has been reassigned elsewhere, go with that
+                                    if index in all_reass.keys():
+                                        c = all_reass[index]
+                                        cell_ind = [
+                                            ks for ks in range(len(k)) if k[ks] == c
+                                        ]
+                                        if len(cell_ind) != 1:
+                                            print(
+                                                f"Warning! Gene {index} has been assigned to {all_reass[index]}, which is not one of the eligible cells in this comparison!"
+                                            )
+                                            continue
+                                        temp = self.df_comp[gene].copy()
+                                        temp = temp.loc[types]
+                                        if len(conf_inds[cell_ind[0]]) > "0":
+                                            conf_inds[cell_ind[0]] = pd.concat(
+                                                [conf_inds[cell_ind[0]], temp], axis=1
+                                            )
+                                        else:
+                                            conf_inds[cell_ind[0]] = temp
                                     else:
-                                        conf_inds[cell_ind[0]] = temp
-                                else:
-                                    temp = self.df_comp[gene].copy()
-                                    temp = temp.loc[types]
-                                    amb_inds[inds].append(temp)
-                                    reass_inds[inds].append(index)
+                                        temp = self.df_comp[gene].copy()
+                                        temp = temp.loc[types]
+                                        amb_inds[inds].append(temp)
+                                        reass_inds[inds].append(index)
 
                     ov_check = []
                     for ind, v in reass_inds.items():
@@ -753,17 +757,18 @@ class SoftAssigner:
                                             )
                                         continue
 
-                                    t_df = self.df_comp[tr_tup[0]].copy()
-                                    t_df = t_df.loc[types]
+                                    if tr_tup[0] in self.df_comp.columns:
+                                        t_df = self.df_comp[tr_tup[0]].copy()
+                                        t_df = t_df.loc[types]
 
-                                    if cell_ind in sel_vals.keys():
-                                        n_val = t_df.values[ind]
-                                        if hasattr(n_val, "__len__"):
-                                            sel_vals[cell_ind].extend(n_val)
+                                        if cell_ind in sel_vals.keys():
+                                            n_val = t_df.values[ind]
+                                            if hasattr(n_val, "__len__"):
+                                                sel_vals[cell_ind].extend(n_val)
+                                            else:
+                                                sel_vals[cell_ind].append(n_val)
                                         else:
-                                            sel_vals[cell_ind].append(n_val)
-                                    else:
-                                        sel_vals[cell_ind] = [t_df.values[ind]]
+                                            sel_vals[cell_ind] = [t_df.values[ind]]
 
                         everything = [
                             v for row in [v for k, v in sel_vals.items()] for v in row
