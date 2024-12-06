@@ -1,4 +1,3 @@
-from tqdm import tqdm
 from collections import Counter
 
 import anndata as ad
@@ -8,6 +7,8 @@ import numpy as np
 import pandas as pd
 import requests
 import scanpy as sc
+from datetaime import datetime
+from tqdm import tqdm
 
 
 def download_lung_dataset(filepath):
@@ -34,10 +35,21 @@ class CellTypeAssigner:
         if adata is not None:
             self.adata = adata
         elif adata_loc is not None:
-            self.adata = ad.read(adata_loc)
+            self.adata = ad.read(adata_loc + "cxg_adata.h5ad")
+            self.adata_loc = adata_loc
         else:
             Exception("Either adata object or file location must be provided.")
         self.verbose = verbose
+
+    def save_annotated_adata(self):
+        if self.adata_loc is None:
+            print("Requires `adata_loc` to be set.")
+        else:
+            dat = datetime.today().strftime("%Y%m%d")
+            filename = f"{self.adata_loc}/cxg_adata_highlevel_wpca_{dat}.h5ad"
+            self.adata.write_h5ad(filename)
+            print(f"Saved {filename}")
+            return filename
 
     def filter_cells(self, adata=None, **kwargs):
         """

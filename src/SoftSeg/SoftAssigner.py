@@ -2,6 +2,7 @@ import ast
 import glob
 import itertools
 import logging
+import random
 import time
 from copy import deepcopy
 from datetime import datetime
@@ -17,6 +18,7 @@ import pandas as pd
 import parse
 import skimage
 import skimage.io
+from matplotlib.patches import Circle
 from skimage.measure import regionprops
 from skimage.segmentation import clear_border
 
@@ -107,6 +109,121 @@ class SoftAssigner:
 
         return list(set(all_fovs) - set(compl))
 
+    def random_complete_fov(self):
+        fovs = self.get_complete_fovs()
+        random.shuffle(fovs)
+        while len(fovs) > 0:
+            yield fovs.pop()
+
+    def random_cell_in_fov(self, fov):
+        """
+        Yields random cell ids from cells that have transcripts mapped to them.
+        """
+
+        im = skimage.io.imread(self.im_loc.format(fov))
+        tr = pd.read_csv(self.complete_csv_name.format(fov))
+
+        # strip out all possible cell ids from tr
+        eligible = set()
+        for r, row in tr.iterrows():
+            assigned = ast.literal_eval(row["cell_ids"])
+            eligible.update(list(assigned.keys()))
+
+        candidates = np.unique(im)[1:]
+        # exclude first element because it's always 0
+        # which is background, not a cell
+
+        random.shuffle(candidates)
+
+        # do this to save memory
+        del im
+        del tr
+
+        while len(candidates) > 0:
+            cell = candidates.pop()
+            # check against transcripts
+            if cell - 1 in eligible:
+                yield cell - 1
+
+    def plot_completed_cell(self, fov, cell):
+        im = skimage.io.imread(self.im_loc.format(fov))
+        tr = pd.read_csv(self.complete_csv_name.format(fov))
+
+        im8 = (im == cell + 1).astype(np.uint8)
+
+        # collect relevant transcripts
+        sel_tr = []
+        for r, row in tr.iterrows():
+            assigned = ast.literal_eval(row["cell_ids"])
+            if str(cell) in assigned.keys() and "lank" not in row["gene"]:
+                sel_tr.append(
+                    {
+                        "x": row["x"],
+                        "y": row["y"],
+                        "z": row["global_z"],
+                        "c": assigned[str(cell)],
+                        "gene": row["gene"],
+                    }
+                )
+        sel_tr = pd.DataFrame(sel_tr)
+
+        # find our bounding box
+        x_0 = np.nanmin(sel_tr["x"]) - 10
+        x_1 = np.nanmax(sel_tr["x"]) + 10
+        y_0 = np.nanmin(sel_tr["y"]) - 10
+        y_1 = np.nanmax(sel_tr["y"]) + 10
+
+        im8 = im8[:, y_0:y_1, x_0:x_1]
+
+        # go through each z slice
+        for z in range(np.shape(im8)[0]):
+            if len(np.unique(im8[z, :, :])) < 2:
+                print(f"Not present on slice {z}")
+                continue
+
+            fig = plt.figure()
+            ax = fig.add_subplot(1, 1, 1)
+            ax.set_title(f"fov_{fov:0>4}, cell {cell}, z-slice {z}")
+
+            # find contour of cell
+            cnt, _ = cv2.findContours(
+                im8[z, :, :], cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            # plot our value map
+            _, ylen, xlen = np.shape(im8)
+            raw_dist = np.empty((ylen, xlen), dtype=np.float32)
+            for i in range(ylen):
+                for j in range(xlen):
+                    raw_dist[i, j] = cv2.pointPolygonTest(cnt[0], (j, i), True)
+
+            drawing = np.zeros((ylen, xlen, 3))
+            for i in range(ylen):
+                for j in range(xlen):
+                    drawing[i, j] = (self.decay_func(raw_dist[i, j]), 0, 0)
+
+            draw_im = cv2.drawContours(drawing, cnt, 0, (1, 1, 1), 1)
+            ax.imshow(draw_im)
+
+            # go through and plot the relevant transcripts
+            for r, row in sel_tr.iterrows():
+                if int(row["z"]) == z:
+                    circle = Circle(
+                        (int(row["x"]) - x_0, int(row["y"]) - y_0),
+                        radius=1,
+                        linewidth=0.0,
+                        facecolor=(row["c"], row["c"], row["c"]),
+                    )
+                    ax.add_patch(circle)
+
+            ax.get_xaxis().set_visible(False)
+            ax.get_yaxis().set_visible(False)
+
+            plt.show()
+
+        del im
+        del tr
+
     def blur_fov(self, f, min_size, max_dist):
         """Run the first step of soft-segmentation, where masks are blurred and
         multiple float values assigned to each transcript, corresponding to which
@@ -141,7 +258,7 @@ class SoftAssigner:
                 elig_z = [plane for plane in range(np.shape(im)[0])]
                 # going to assume that the z-axis is the 0th
 
-            for m in np.unique(im):  # FIXME iterate through contours
+            for m in np.unique(im):
                 if m == 0:  # not a cell
                     continue
                 temp_im = (im == m).astype(np.uint8)
@@ -170,7 +287,7 @@ class SoftAssigner:
                             else dict(
                                 row["cell_ids"],
                                 **{
-                                    str(m): self.decay_func(
+                                    str(m - 1): self.decay_func(
                                         cv2.pointPolygonTest(
                                             cnt[0], (row["x"] - 1, row["y"] - 1), True
                                         )
@@ -205,17 +322,19 @@ class SoftAssigner:
                             if row["global_z"] not in elig_z
                             or row["global_z"] not in cntz.keys()
                             or cv2.pointPolygonTest(
-                                cntz[row["global_z"]], (row["x"] - 1, row["y"] - 1), True
+                                cntz[row["global_z"]],
+                                (row["x"] - 1, row["y"] - 1),
+                                True,
                             )
                             < -1 * max_dist
                             else dict(
                                 row["cell_ids"],
                                 **{
-                                    str(m): self.decay_func(
+                                    str(m - 1): self.decay_func(
                                         cv2.pointPolygonTest(
                                             cntz[row["global_z"]],
                                             (row["x"] - 1, row["y"] - 1),
-                                            True
+                                            True,
                                         )
                                     )
                                 },
@@ -269,158 +388,6 @@ class SoftAssigner:
             pool.starmap(
                 self.blur_fov,
                 zip(sel_fovs, repeat(min_size), repeat(max_dist)),
-            )
-
-    def blur_fov_dep(self, f, min_size, dilate, sigma, min_thresh):
-        """OUTDATED METHOD.
-
-        Run the first step of soft-segmentation, where masks are blurred and
-        multiple float values assigned to each transcript, corresponding to which
-        cells they may be members of and their relative likelihoods.
-
-        f: fov number
-        min_size: minimum size for eligible masks.
-        dilate: radius to dilate masks by, in pixels.
-        sigma: the sigma value for the gaussian blur.
-        min_thresh: minimum value of a blurred mask pixel for a transcript to be eligible.
-
-        writes to disk: self.complete_csv_name.format(f)
-        returns: (tr, intensities)
-         tr: dataframe of transcript information
-         intensities: list of all assigned intensity values
-        """
-        t1 = time.time()
-        im = skimage.io.imread(self.im_loc.format(f))
-        # filter this before we do anything else to save time...
-        im = size_filter(im, min_size=min_size)
-
-        tr = pd.read_csv(self.csv_loc.format(f), index_col=0)
-        tr = tr.reset_index()
-
-        if len(tr) > 0:
-            self.logger.info(f"[{datetime.now()}] starting fov_{f:0>4}...")
-
-            if "cell_ids" in tr.keys():
-                tr.drop(["cell_ids"], axis=1, inplace=True)
-
-            tr["cell_ids"] = [{} for _ in range(len(tr))]
-
-            if len(np.shape(im)) > 2:
-                elig_z = [plane for plane in range(np.shape(im)[0])]
-                # going to assume that the z-axis is the 0th
-
-            for m in np.unique(im):
-                if m == 0:  # not a cell
-                    continue
-
-                # print(f"cell {m}")
-                temp_im = im == m
-
-                def fn(y):
-                    return skimage.morphology.binary_dilation(
-                        y, skimage.morphology.disk(dilate)
-                    )
-
-                if len(np.shape(temp_im)) == 2:  # two dimensional
-                    filt = fn(temp_im)
-                    filt = skimage.filters.gaussian(filt, sigma=sigma)
-                    tr["cell_ids"] = tr.apply(
-                        lambda row: (
-                            row["cell_ids"]
-                            if not filt[row["y"] - 1, row["x"] - 1] > min_thresh
-                            else dict(
-                                row["cell_ids"],
-                                **{str(m): filt[row["y"] - 1, row["x"] - 1]},
-                            )
-                        ),
-                        axis=1,
-                    )
-                else:  # three dimensional (presumably)
-                    filt = np.array([fn(sl) for sl in temp_im])
-                    filt = np.array(
-                        [skimage.filters.gaussian(sl, sigma=sigma) for sl in filt]
-                    )
-                    # slices in image may not line up with data...
-                    tr["cell_ids"] = tr.apply(
-                        lambda row: (
-                            row["cell_ids"]
-                            if row["global_z"] not in elig_z
-                            or (
-                                not filt[row["global_z"], row["y"] - 1, row["x"] - 1]
-                                > min_thresh
-                            )
-                            else dict(
-                                row["cell_ids"],
-                                **{
-                                    str(m): filt[
-                                        row["global_z"], row["y"] - 1, row["x"] - 1
-                                    ]
-                                },
-                            )
-                        ),
-                        axis=1,
-                    )
-
-                del filt
-                del temp_im
-            del im
-
-            tr.to_csv(self.complete_csv_name.format(f), index=False)
-
-            self.logger.info(
-                f"[{datetime.now()}] saved fov_{f:0>4}\n\t{len(tr)} transcripts, now unpacking intensities..."
-            )
-
-            tr = tr.set_index("index")
-
-            intensities = []
-            for i, row in tr.iterrows():
-                for k, v in row["cell_ids"].items():
-                    intensities.append(v)
-
-            print(f"Completed fov_{f:0>4}.")
-            print(
-                f"\t{len(intensities)} assigned to cells, {len(tr)} transcripts total."
-            )
-            print(f"\ttime taken:{(time.time() - t1)/60} minutes.")
-
-            return (tr, intensities)
-
-        else:
-            print(f"Skipping fov_{f:0>4}, no transcripts found.")
-            return None
-
-    def blur_all_fovs_dep(
-        self, min_size, dilate, sigma, min_thresh=None, sel_fovs=None
-    ):
-        """DEPRECATED METHOD
-
-        Run the first step of soft-segmentation, where masks are blurred and
-        multiple float values assigned to each transcript, corresponding to which
-        cells they may be members of and their relative likelihoods.
-
-        This method will run on all eligible FOVs, using the multiprocessing pool.
-
-        pool_size: the number of threads to be used.
-        min_size: minimum size for eligible masks.
-        dilate: radius to dilate masks by, in pixels.
-        sigma: the sigma value for the gaussian blur.
-        min_thresh: minimum value of a blurred mask pixel for a transcript to be eligible.
-
-        writes to disk: self.complete_csv_name.format(f) for all FOVs.
-        """
-        if sel_fovs is None:
-            sel_fovs = self.get_incomplete_fovs()
-        with Pool(self.pool_size) as pool:
-            pool.starmap(
-                self.blur_fov,
-                zip(
-                    sel_fovs,
-                    repeat(min_size),
-                    repeat(dilate),
-                    repeat(sigma),
-                    repeat(min_thresh),
-                ),
             )
 
     def combine_soft_csvs(self):
@@ -539,11 +506,8 @@ class SoftAssigner:
         Converts all completed analyses to adata format.
 
         fov_locs: dict containing the start positions of each fov
-        thresh: transcripts with value lower than this will not be retained.
+        min_thresh: transcripts with value lower than this will not be retained.
         """
-        if min_thresh is None:
-            min_thresh = self.min_thresh
-
         cxg_dict = {}
         fovs = self.get_complete_fovs()
         for f in fovs:
@@ -551,7 +515,7 @@ class SoftAssigner:
             for i, row in tr.iterrows():
                 assigned = ast.literal_eval(row["cell_ids"])
                 for k, v in assigned.items():
-                    if float(v) > min_thresh:
+                    if min_thresh is None or float(v) > min_thresh:
                         if k in cxg_dict.keys():
                             if row["gene"] in cxg_dict[k].keys():
                                 cxg_dict[k][row["gene"]] += 1
@@ -628,7 +592,9 @@ class SoftAssigner:
                     del moments
                 del all_contours
                 del im
-                self.logger.info(f"[{datetime.now()}] completed converting fov_{f:0>4}.")
+                self.logger.info(
+                    f"[{datetime.now()}] completed converting fov_{f:0>4}."
+                )
             else:
                 self.logger.info(f"[{datetime.now()}] skipped converting fov_{f:0>4}.")
 
@@ -685,9 +651,6 @@ class SoftAssigner:
         results = {}
         dupe_ass = {}
 
-        if min_thresh is None:
-            min_thresh = self.min_thresh
-
         if conf_thresh is None:
             conf_thresh = self.conf_thresh
 
@@ -714,7 +677,13 @@ class SoftAssigner:
                     # now, select for transcripts above threshold
                     # these are the only things eligible to be assigned to
                     pos_keys = tuple(
-                        sorted([k for k in elg_cells if asst[k] > min_thresh])
+                        sorted(
+                            [
+                                k
+                                for k in elg_cells
+                                if (min_thresh is None or asst[k] > min_thresh)
+                            ]
+                        )
                     )
 
                     # if it's not eligible to be assigned to anything, we don't care...
@@ -776,7 +745,9 @@ class SoftAssigner:
                 asst = ast.literal_eval(row["cell_ids"])
                 if len(asst.keys()) > 1:
                     for key, v in asst.items():
-                        if v > min_thresh and "lank" not in row["gene"]:
+                        if (min_thresh is None or v > min_thresh) and "lank" not in row[
+                            "gene"
+                        ]:
                             if key in conf_tr.keys():
                                 conf_tr[key].append(row["gene"])
                             else:
