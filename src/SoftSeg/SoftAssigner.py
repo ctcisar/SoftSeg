@@ -129,7 +129,7 @@ class SoftAssigner:
             assigned = ast.literal_eval(row["cell_ids"])
             eligible.update(list(assigned.keys()))
 
-        candidates = np.unique(im)[1:]
+        candidates = list(np.unique(im)[1:])
         # exclude first element because it's always 0
         # which is background, not a cell
 
@@ -142,7 +142,7 @@ class SoftAssigner:
         while len(candidates) > 0:
             cell = candidates.pop()
             # check against transcripts
-            if cell - 1 in eligible:
+            if str(cell - 1) in eligible:
                 yield cell - 1
 
     def plot_completed_cell(self, fov, cell):
@@ -178,7 +178,7 @@ class SoftAssigner:
         # go through each z slice
         for z in range(np.shape(im8)[0]):
             if len(np.unique(im8[z, :, :])) < 2:
-                print(f"Not present on slice {z}")
+                print(f"Cell {cell} not present on slice {z}")
                 continue
 
             fig = plt.figure()
@@ -219,7 +219,7 @@ class SoftAssigner:
             ax.get_xaxis().set_visible(False)
             ax.get_yaxis().set_visible(False)
 
-            plt.show()
+            plt.show(block=False)
 
         del im
         del tr
@@ -413,7 +413,7 @@ class SoftAssigner:
         "conservative": defines threshold as lowest value where no transcript is
             multiply-assigned.
         """
-        if self.num_transcripts is not None:
+        if hasattr(self, "num_transcripts"):
             tr_tally = self.num_transcripts
         else:
             tr_tally = 10000
@@ -431,8 +431,9 @@ class SoftAssigner:
 
                 # make the mat wider if needed
                 if np.shape(cutoffs)[1] < len(assigned):
-                    n_wid = len(assigned) - np.shape(cutoffs)[1]
-                    cutoffs = np.append(cutoffs, np.empty((tr_tally, n_wid)), axis=1)
+                    n_wid_inc = len(assigned) - np.shape(cutoffs)[1]
+                    cutoffs = np.append(cutoffs, np.empty((np.shape(cutoffs)[0], n_wid_inc)), axis=1)
+                    n_wid = n_wid + n_wid_inc
 
                 if np.shape(cutoffs)[0] == c_row:
                     cutoffs = np.append(cutoffs, np.empty((tr_tally, n_wid)), axis=0)
@@ -447,7 +448,7 @@ class SoftAssigner:
         assigned_tr = []
         dupe_tr = []
         num = 100  # resolution for estimate
-        rang = np.linspace(0, 1, num=num)
+        rang = np.linspace(0.1, 1, num=num)
 
         for thresh in rang:
             assd = cutoffs > thresh
@@ -456,7 +457,7 @@ class SoftAssigner:
 
         dif = np.diff(np.diff(dupe_tr))
 
-        if show_plots():
+        if show_plots:
             fig, ax = plt.subplots()
             im = ax.scatter(assigned_tr, dupe_tr, c=rang)
             # ax.set_xscale("log")
@@ -480,10 +481,10 @@ class SoftAssigner:
         percentile = np.argmax(dif)
 
         ass_per = [dupe_tr[i] / assigned_tr[i] * 100 for i in range(num)]
-        fir = ass_per.index(0)
+        fir = ass_per.index(min(ass_per))
 
         if show_plots:
-            plt.show()
+            plt.show(block=False)
 
         # defaults to saving the conservative threshold
         self.conf_thresh = rang[fir]
