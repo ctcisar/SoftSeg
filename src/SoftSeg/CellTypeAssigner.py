@@ -1,4 +1,5 @@
 from collections import Counter
+from datetime import datetime
 
 import anndata as ad
 import matplotlib
@@ -7,7 +8,6 @@ import numpy as np
 import pandas as pd
 import requests
 import scanpy as sc
-from datetaime import datetime
 from tqdm import tqdm
 
 
@@ -62,6 +62,7 @@ class CellTypeAssigner:
         and they will be executed in order.
         https://scanpy.readthedocs.io/en/stable/generated/scanpy.pp.filter_cells.html
         """
+        internal = False
         if adata is None:
             internal = True
             adata = self.adata
@@ -89,6 +90,7 @@ class CellTypeAssigner:
         and they will be executed in order.
         https://scanpy.readthedocs.io/en/stable/generated/scanpy.pp.filter_genes.html
         """
+        internal = False
         if adata is None:
             internal = True
             adata = self.adata
@@ -105,7 +107,21 @@ class CellTypeAssigner:
         else:
             return adata
 
+    def filter_blanks(self, adata=None):
+        internal = False
+        if adata is None:
+            internal = True
+            adata = self.adata
+
+        valid_genes = [name for name in adata.var_names if "lank" not in name]
+        indicator = np.in1d(adata.var_names, valid_genes)
+        if internal:
+            self.adata = adata[:, indicator]
+        else:
+            return adata[:, indicator]
+
     def apply_qc(self, adata=None):
+        internal = False
         if adata is None:
             internal = True
             adata = self.adata
@@ -197,7 +213,7 @@ class CellTypeAssigner:
             plt.show(block=False)
 
         for celltype in sorted(self.celltypes):
-            fig, ax = sc.pl.dotplot(
+            sc.pl.dotplot(
                 self.adata,
                 self.pos_markers[celltype][:20],
                 groupby="leiden",
@@ -206,7 +222,7 @@ class CellTypeAssigner:
             )
             plt.show(block=False)
 
-            fig, ax = sc.pl.dotplot(
+            sc.pl.dotplot(
                 self.adata,
                 self.neg_markers[celltype][:20],
                 groupby="leiden",
@@ -265,16 +281,3 @@ class CellTypeAssigner:
         # UMAP
         sc.pl.umap(self.adata, color=[obs_level], cmap="tab20")
         plt.show()
-
-    def pretty_joiner(self, adatas):
-        """
-        Combines anndata frames while retaining .var
-        adatas is expected to be a list of anndata structures
-        to be concatenated.
-        """
-        result = pd.concat(adatas, join="outer")
-        all_vars = [x.var for x in adatas[0]]
-        all_vars = pd.concat(all_vars)
-        all_vars = all_vars[~all_vars.index.duplicated()]
-        result.var = all_vars.loc[result.var_names]
-        return result

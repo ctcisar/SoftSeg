@@ -50,6 +50,22 @@ def size_filter(im, min_size=None, max_size=None):
     return np.vectorize(will_del)(im)
 
 
+def getContour(tif, i):
+    binimg = deepcopy(tif)
+    binimg[binimg != i] = 0
+    binimg[binimg > 0] = 1
+    binimg = binimg.astype("uint8")
+    contours = []
+    for n in range(np.shape(binimg)[0]):
+        contours.append(
+            cv2.findContours(binimg[n, :, :], cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)[
+                -2
+            ]
+        )
+    del binimg
+    return contours, i
+
+
 class SoftAssigner:
     def __init__(
         self,
@@ -145,23 +161,30 @@ class SoftAssigner:
             if str(cell - 1) in eligible:
                 yield cell - 1
 
-    def plot_completed_cell(self, fov, cell):
+    def plot_completed_cell(self, fov, cells):
         im = skimage.io.imread(self.im_loc.format(fov))
         tr = pd.read_csv(self.complete_csv_name.format(fov))
-
-        im8 = (im == cell + 1).astype(np.uint8)
 
         # collect relevant transcripts
         sel_tr = []
         for r, row in tr.iterrows():
             assigned = ast.literal_eval(row["cell_ids"])
-            if str(cell) in assigned.keys() and "lank" not in row["gene"]:
+            if "lank" not in row["gene"] and any(
+                [str(cell) in assigned.keys() for cell in cells]
+            ):
+                cs = [0, 0, 0]
+                for i in range(len(cells)):
+                    if str(cells[i]) in assigned.keys():
+                        cs[i] = assigned[str(cells[i])]
+
                 sel_tr.append(
                     {
                         "x": row["x"],
                         "y": row["y"],
                         "z": row["global_z"],
-                        "c": assigned[str(cell)],
+                        "c0": cs[0],
+                        "c1": cs[1],
+                        "c2": cs[2],
                         "gene": row["gene"],
                     }
                 )
@@ -173,36 +196,67 @@ class SoftAssigner:
         y_0 = np.nanmin(sel_tr["y"]) - 10
         y_1 = np.nanmax(sel_tr["y"]) + 10
 
-        im8 = im8[:, y_0:y_1, x_0:x_1]
+        im8 = [(im == cell + 1).astype(np.uint8)[:, y_0:y_1, x_0:x_1] for cell in cells]
 
         # go through each z slice
-        for z in range(np.shape(im8)[0]):
-            if len(np.unique(im8[z, :, :])) < 2:
-                print(f"Cell {cell} not present on slice {z}")
+        for z in range(np.shape(im8)[1]):
+            clen = np.shape(im8)[0]
+
+            c_valid = []
+            cnt = []
+            for c in range(clen):
+                if len(np.unique(im8[c][z, :, :])) < 2:
+                    print(f"Cell {cells[c]} not present on slice {z}")
+                    cnt.append(None)
+                    c_valid.append(False)
+                else:
+                    cnt.append(
+                        cv2.findContours(
+                            im8[c][z, :, :], cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+                        )[0]
+                    )
+                    c_valid.append(True)
+
+            if not any(c_valid):
+                print("No valid cells in this slice.")
                 continue
 
             fig = plt.figure()
             ax = fig.add_subplot(1, 1, 1)
-            ax.set_title(f"fov_{fov:0>4}, cell {cell}, z-slice {z}")
-
-            # find contour of cell
-            cnt, _ = cv2.findContours(
-                im8[z, :, :], cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
-            )
+            ax.set_title(f"fov_{fov:0>4}, {cells}, z-slice {z}")
 
             # plot our value map
-            _, ylen, xlen = np.shape(im8)
-            raw_dist = np.empty((ylen, xlen), dtype=np.float32)
+            _, ylen, xlen = np.shape(im8[0])
+
+            raw_dist = np.empty((ylen, xlen, clen), dtype=np.float32)
             for i in range(ylen):
                 for j in range(xlen):
-                    raw_dist[i, j] = cv2.pointPolygonTest(cnt[0], (j, i), True)
+                    for c in range(clen):
+                        if c_valid[c]:
+                            raw_dist[i, j, c] = cv2.pointPolygonTest(
+                                cnt[c][0], (j, i), True
+                            )
 
             drawing = np.zeros((ylen, xlen, 3))
             for i in range(ylen):
                 for j in range(xlen):
-                    drawing[i, j] = (self.decay_func(raw_dist[i, j]), 0, 0)
+                    drawing[i, j] = (
+                        self.decay_func(raw_dist[i, j, 0]),
+                        (
+                            self.decay_func(raw_dist[i, j, 1])
+                            if clen > 1 and c_valid[1]
+                            else 0
+                        ),
+                        (
+                            self.decay_func(raw_dist[i, j, 2])
+                            if clen > 2 and c_valid[2]
+                            else 0
+                        ),
+                    )
 
-            draw_im = cv2.drawContours(drawing, cnt, 0, (1, 1, 1), 1)
+            for cn in cnt:
+                draw_im = cv2.drawContours(drawing, cn, 0, (1, 1, 1), 1)
+
             ax.imshow(draw_im)
 
             # go through and plot the relevant transcripts
@@ -212,7 +266,7 @@ class SoftAssigner:
                         (int(row["x"]) - x_0, int(row["y"]) - y_0),
                         radius=1,
                         linewidth=0.0,
-                        facecolor=(row["c"], row["c"], row["c"]),
+                        facecolor=(row["c1"], row["c2"], row["c0"]),
                     )
                     ax.add_patch(circle)
 
@@ -432,7 +486,9 @@ class SoftAssigner:
                 # make the mat wider if needed
                 if np.shape(cutoffs)[1] < len(assigned):
                     n_wid_inc = len(assigned) - np.shape(cutoffs)[1]
-                    cutoffs = np.append(cutoffs, np.empty((np.shape(cutoffs)[0], n_wid_inc)), axis=1)
+                    cutoffs = np.append(
+                        cutoffs, np.empty((np.shape(cutoffs)[0], n_wid_inc)), axis=1
+                    )
                     n_wid = n_wid + n_wid_inc
 
                 if np.shape(cutoffs)[0] == c_row:
@@ -538,32 +594,19 @@ class SoftAssigner:
         adata.obs["y_coords"] = pd.DataFrame(np.zeros((len(adata), 1)))
         adata.obs["z_coords"] = pd.DataFrame(np.zeros((len(adata), 1)))
 
-        def getContour(tif, i):
-            binimg = deepcopy(tif)
-            binimg[binimg != i] = 0
-            binimg[binimg > 0] = 1
-            binimg = binimg.astype("uint8")
-            contours = []
-            for n in range(np.shape(binimg)[0]):
-                contours.append(
-                    cv2.findContours(
-                        binimg[n, :, :], cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
-                    )[-2]
-                )
-            del binimg
-            return contours, i
+        with np.printoptions(threshold=np.inf):
+            self.logger.debug(f"All valid cell ids: {adata.obs_names}")
 
         for f in fovs:
             if Path(self.im_loc.format(f)).is_file():
                 im = skimage.io.imread(self.im_loc.format(f))
                 im = clear_border(im)
                 with Pool(self.pool_size) as pool:
-                    results = pool.starmap(
-                        getContour, zip(repeat(im), list(set(im.flatten())))
-                    )
-                all_contours = {i: contour for contour, i in results}
+                    results = pool.starmap(getContour, zip(repeat(im), np.unique(im)))
+                all_contours = {i - 1: contour for contour, i in results}
                 for k, v in all_contours.items():
                     if k == 0 or str(k) not in adata.obs_names:  # don't run on bg
+                        self.logger.debug(f"[{datetime.now()}] cell id {k} not valid.")
                         continue
                     moments = []
                     for n in range(len(v)):
