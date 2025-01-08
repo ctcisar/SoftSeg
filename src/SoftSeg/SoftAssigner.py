@@ -18,6 +18,7 @@ import pandas as pd
 import parse
 import skimage
 import skimage.io
+import yaml
 from matplotlib.patches import Circle
 from skimage.measure import regionprops
 from skimage.segmentation import clear_border
@@ -211,7 +212,7 @@ class SoftAssigner:
                         "c1": cs[1],
                         "c2": cs[2],
                         "gene": row["gene"],
-                        "index": row["index"]
+                        "index": row["index"],
                     }
                 )
         sel_tr = pd.DataFrame(sel_tr)
@@ -267,11 +268,7 @@ class SoftAssigner:
             for i in range(ylen):
                 for j in range(xlen):
                     drawing[i, j] = (
-                        (
-                            self.decay_func(raw_dist[i, j, 0])
-                            if c_valid[0]
-                            else 0
-                        ),
+                        (self.decay_func(raw_dist[i, j, 0]) if c_valid[0] else 0),
                         (
                             self.decay_func(raw_dist[i, j, 1])
                             if clen > 1 and c_valid[1]
@@ -823,6 +820,13 @@ class SoftAssigner:
             for k in to_del:
                 dupe_ass[f].pop(k, None)
 
+            self.logger.info(
+                f"[{datetime.now()}] complete set of duplicated regions for fov_{f:0>4}\n{yaml.dump(dupe_ass[f])}"
+            )
+            self.logger.debug(
+                f"[{datetime.now()}] cell combos removed for fov_{f:0>4}: {to_del}"
+            )
+
             # find and save all confident assignments, to avoid
             # repeated iteration for each pairing
             conf_tr = {}
@@ -972,11 +976,18 @@ class SoftAssigner:
                                     tr_id = tr_tup[1]
                                     row = tr.loc[tr["index"] == int(tr_id)]
                                     if len(np.shape(im)) == 2:
-                                        one_cell_ind = im[row["y"] - 1, row["x"] - 1][0] - 1
+                                        one_cell_ind = (
+                                            im[row["y"] - 1, row["x"] - 1][0] - 1
+                                        )
                                     else:
-                                        one_cell_ind = im[
-                                            row["global_z"], row["y"] - 1, row["x"] - 1
-                                        ][0] - 1
+                                        one_cell_ind = (
+                                            im[
+                                                row["global_z"],
+                                                row["y"] - 1,
+                                                row["x"] - 1,
+                                            ][0]
+                                            - 1
+                                        )
                                     if str(one_cell_ind) in list(sel_keyset):
                                         ind = list(sel_keyset).index(str(one_cell_ind))
                                     else:
@@ -1017,9 +1028,7 @@ class SoftAssigner:
                         for ge in reass_inds[key_ref[v]]:
                             all_reass[ge] = winning_combo[v]
                             if winning_combo[v] != "Original":
-                                tr_writer.write(
-                                    f" {ge}, {all_reass[ge]}\n"
-                                )
+                                tr_writer.write(f" {ge}, {all_reass[ge]}\n")
                         if winning_combo[v] != "Original":
                             results[key_ref[v]] = extract_celltype(
                                 cats, adata.obs.loc[[winning_combo[v]]]
