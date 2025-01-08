@@ -161,7 +161,32 @@ class SoftAssigner:
             if str(cell - 1) in eligible:
                 yield cell - 1
 
-    def plot_completed_cell(self, fov, cells):
+    def cell_to_fov(self, cell_ids):
+        """
+        Given
+            int: cell_ids OR
+            [int]: cell_ids
+        Returns the FOV that the cell is in, in the form
+            {int: cell id, str: fov}
+        This is inefficient so avoid it if you can.
+        """
+
+        # convert to list if it's a singluar cell
+        if isinstance(cell_ids, int):
+            cell_ids = [cell_ids]
+
+        results = {}
+        for f in self.get_complete_fovs():
+            trs = pd.read_csv(self.complete_csv_name.format(f))
+            for i, row in trs.iterrows():
+                for c, v in ast.literal_eval(row["cell_ids"]).items():
+                    if int(c) in cell_ids:
+                        results[int(c)] = f
+                        if len(results) == len(cell_ids):
+                            return results
+        return results
+
+    def plot_completed_cell(self, fov, cells, tr_hi=None):
         im = skimage.io.imread(self.im_loc.format(fov))
         tr = pd.read_csv(self.complete_csv_name.format(fov))
 
@@ -186,6 +211,7 @@ class SoftAssigner:
                         "c1": cs[1],
                         "c2": cs[2],
                         "gene": row["gene"],
+                        "index": row["index"]
                     }
                 )
         sel_tr = pd.DataFrame(sel_tr)
@@ -241,7 +267,11 @@ class SoftAssigner:
             for i in range(ylen):
                 for j in range(xlen):
                     drawing[i, j] = (
-                        self.decay_func(raw_dist[i, j, 0]),
+                        (
+                            self.decay_func(raw_dist[i, j, 0])
+                            if c_valid[0]
+                            else 0
+                        ),
                         (
                             self.decay_func(raw_dist[i, j, 1])
                             if clen > 1 and c_valid[1]
@@ -262,11 +292,20 @@ class SoftAssigner:
             # go through and plot the relevant transcripts
             for r, row in sel_tr.iterrows():
                 if int(row["z"]) == z:
+                    facecolor = (row["c1"], row["c2"], row["c0"])
+                    if tr_hi is not None:
+                        for k, vs in tr_hi.items():
+                            if isinstance(vs, list):
+                                if row[k] in vs:
+                                    facecolor = (1, 1, 1)
+                            else:
+                                if row[k] == vs:
+                                    facecolor = (1, 1, 1)
                     circle = Circle(
                         (int(row["x"]) - x_0, int(row["y"]) - y_0),
                         radius=1,
                         linewidth=0.0,
-                        facecolor=(row["c1"], row["c2"], row["c0"]),
+                        facecolor=facecolor,
                     )
                     ax.add_patch(circle)
 
@@ -680,12 +719,12 @@ class SoftAssigner:
             this_type = [
                 row[n].values[0] for n, m in cats.items() if row[n].values[0] in m
             ]
-            if len(this_type > 1):
+            if len(this_type) > 1:
                 print(
                     f"Warning! Cell {row.index} has multiple valid celltypes: {this_type}. Discarding..."
                 )
                 return
-            if len(this_type > 0):
+            if len(this_type) > 0:
                 return this_type[0]
 
         if sel_fovs is None:
@@ -694,6 +733,8 @@ class SoftAssigner:
         all_reass = {}
         results = {}
         dupe_ass = {}
+        tr_writer = open(f"{self.complete_loc}{datetime.now()}_changed_trs.csv", "w")
+        tr_writer.write("transcript ID, cell ID\n")
 
         if conf_thresh is None:
             conf_thresh = self.conf_thresh
@@ -815,7 +856,7 @@ class SoftAssigner:
                     reass_inds = {}
 
                     # get our celltypes
-                    types = [extract_celltype(cats, i) for i in k]
+                    types = [extract_celltype(cats, adata.obs.loc[[i]]) for i in k]
 
                     # need to go through and retrieve the confident transcripts
                     conf_inds = []
@@ -930,11 +971,16 @@ class SoftAssigner:
                                 for tr_tup in gene_lis[sel_keyset]:
                                     tr_id = tr_tup[1]
                                     row = tr.loc[tr["index"] == int(tr_id)]
-                                    one_cell_ind = im[row["y"] - 1, row["x"] - 1][0]
+                                    if len(np.shape(im)) == 2:
+                                        one_cell_ind = im[row["y"] - 1, row["x"] - 1][0] - 1
+                                    else:
+                                        one_cell_ind = im[
+                                            row["global_z"], row["y"] - 1, row["x"] - 1
+                                        ][0] - 1
                                     if str(one_cell_ind) in list(sel_keyset):
                                         ind = list(sel_keyset).index(str(one_cell_ind))
                                     else:
-                                        if one_cell_ind != 0:
+                                        if one_cell_ind > 0:
                                             print(
                                                 f"Warning! Original cell assignment {one_cell_ind} for transcript {tr_id} not in possible comparison list {sel_keyset}!"
                                             )
@@ -970,6 +1016,10 @@ class SoftAssigner:
                     for v in range(len(winning_combo)):
                         for ge in reass_inds[key_ref[v]]:
                             all_reass[ge] = winning_combo[v]
+                            if winning_combo[v] != "Original":
+                                tr_writer.write(
+                                    f" {ge}, {all_reass[ge]}\n"
+                                )
                         if winning_combo[v] != "Original":
                             results[key_ref[v]] = extract_celltype(
                                 cats, adata.obs.loc[[winning_combo[v]]]
@@ -984,4 +1034,5 @@ class SoftAssigner:
                     for k, v in reass_inds.items():
                         all_reass_check.update(set(v))
 
+        tr_writer.close()
         return results
