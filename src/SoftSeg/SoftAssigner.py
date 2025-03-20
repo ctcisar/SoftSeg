@@ -4,6 +4,7 @@ import itertools
 import logging
 import random
 import time
+from collections import Counter
 from copy import deepcopy
 from datetime import datetime
 from itertools import repeat
@@ -65,6 +66,22 @@ def getContour(tif, i):
         )
     del binimg
     return contours, i
+
+
+def remove_border(im):
+    result = []
+    removed = set()
+    for z in im:
+        result.append(clear_border(z))
+        removed.update(set(np.unique(z)) - set(np.unique(result[-1])))
+
+    result = np.array(result)
+    print(np.shape(result))
+
+    for r in removed:
+        result[result == r] = 0
+
+    return result
 
 
 class SoftAssigner:
@@ -339,9 +356,11 @@ class SoftAssigner:
         if len(tr) > 0:
             self.logger.info(f"[{datetime.now()}] starting fov_{f:0>4}...")
 
+            # override if if it's alraedy there'
             if "cell_ids" in tr.keys():
                 tr.drop(["cell_ids"], axis=1, inplace=True)
 
+            # add empty column that we're about to populate'
             tr["cell_ids"] = [{} for _ in range(len(tr))]
 
             if len(np.shape(im)) > 2:
@@ -349,7 +368,7 @@ class SoftAssigner:
                 # going to assume that the z-axis is the 0th
 
             for m in np.unique(im):
-                if m == 0:  # not a cell
+                if m == 0:  # background, not a cell
                     continue
                 temp_im = (im == m).astype(np.uint8)
 
@@ -359,25 +378,25 @@ class SoftAssigner:
                     )
                     if len(cnt) > 1:
                         self.logger.info(
-                            f"WARNING! Cell ID {m} has {len(cnt)} total contours, only using the first."
+                            f"WARNING! Cell ID {m-1} has {len(cnt)} total contours, only using the first."
                         )
                     elif len(cnt) == 0:
                         self.logger.info(
-                            f"WARNING! Cell ID {m} has no eligible contours. Skipping cell ID {m}."
+                            f"WARNING! Cell ID {m-1} has no eligible contours. Skipping cell ID {m-1}."
                         )
                         continue
 
                     tr["cell_ids"] = tr.apply(
                         lambda row: (
-                            row["cell_ids"]
+                            row["cell_ids"]  # default to keeping the dict the same
                             if cv2.pointPolygonTest(
                                 cnt[0], (row["x"] - 1, row["y"] - 1), True
                             )
-                            < -1 * max_dist
-                            else dict(
+                            < -1 * max_dist  # if this assignment distance passes our threshold
+                            else dict(  # add this index to the dict of eligible assignments
                                 row["cell_ids"],
                                 **{
-                                    str(m - 1): self.decay_func(
+                                    str(m - 1): self.decay_func(  # this is where we account for images being 1-indexed
                                         cv2.pointPolygonTest(
                                             cnt[0], (row["x"] - 1, row["y"] - 1), True
                                         )
@@ -396,11 +415,11 @@ class SoftAssigner:
                         )
                         if len(cnt) > 1:
                             self.logger.info(
-                                f"WARNING! Cell ID {m} zslice {z} has {len(cnt)} total contours, only using the first."
+                                f"WARNING! Cell ID {m-1} zslice {z} has {len(cnt)} total contours, only using the first."
                             )
                         elif len(cnt) == 0:
                             self.logger.info(
-                                f"WARNING! Cell ID {m} zslice {z} has no eligible contours. Skipping zslice {z}."
+                                f"WARNING! Cell ID {m-1} zslice {z} has no eligible contours. Skipping zslice {z}."
                             )
                             continue
 
@@ -408,7 +427,7 @@ class SoftAssigner:
 
                     tr["cell_ids"] = tr.apply(
                         lambda row: (
-                            row["cell_ids"]
+                            row["cell_ids"]  # default to keeping the dict the same
                             if row["global_z"] not in elig_z
                             or row["global_z"] not in cntz.keys()
                             or cv2.pointPolygonTest(
@@ -416,11 +435,11 @@ class SoftAssigner:
                                 (row["x"] - 1, row["y"] - 1),
                                 True,
                             )
-                            < -1 * max_dist
-                            else dict(
+                            < -1 * max_dist  # if this assignment is eligible by its zslice and also passes the threshold
+                            else dict(  # add this index to the dict of eligible assignments
                                 row["cell_ids"],
                                 **{
-                                    str(m - 1): self.decay_func(
+                                    str(m - 1): self.decay_func(  # this is where we account for images being 1-indexed
                                         cv2.pointPolygonTest(
                                             cntz[row["global_z"]],
                                             (row["x"] - 1, row["y"] - 1),
@@ -493,6 +512,24 @@ class SoftAssigner:
         full_tr.to_csv(f"{self.complete_loc}all_soft_cellids.csv", index=False)
         self.num_transcripts = len(full_tr)
 
+    def assign_to_cell(self, assigned, min_thresh=None):
+        """
+        modularizing the transcript assignment method to make things more easily
+        changable in the future.
+        assigned: dict():
+              key: cell id
+            value: confidence assigned to the transcript w this cell
+
+        returns: id of cell (if valid), or None (if no valid target)
+        """
+        total = sum([float(v) for v in assigned.values()])
+        if total == 0:
+            return None
+        for k, v in assigned.items():
+            if (min_thresh is None or float(v) / total > min_thresh) and float(v) > 0.5:
+                return k
+        return None
+
     def calculate_confident_threshold(self, show_plots=False):
         """
         Finds the ideal threshold for what should be considered a 'confident' assignment.
@@ -506,73 +543,138 @@ class SoftAssigner:
         if hasattr(self, "num_transcripts"):
             tr_tally = self.num_transcripts
         else:
-            tr_tally = 10000
-        n_wid = 5  # initial guess for max number of cells a transcript is assigned to
-        cutoffs = np.empty((tr_tally, n_wid))
+            tr_tally = 10000000
+        n_wid = 12  # initial guess for max number of cells a transcript is assigned to
+        cells = [np.empty((tr_tally, n_wid))]
+        cutoff = [np.empty((tr_tally, n_wid))]
+        mat_ind = 0
         c_row = 0
+        c_row_total = 0
+        cell_list = set()
 
         sel_fovs = self.get_complete_fovs()
 
         for f in sel_fovs:
+            self.logger.info(f"Reading in fov {f}\t{datetime.now()}")
             tr = pd.read_csv(self.complete_csv_name.format(f))
             for r, row in tr.iterrows():
                 assigned = ast.literal_eval(row["cell_ids"])
                 ind = 0
 
                 # make the mat wider if needed
-                if np.shape(cutoffs)[1] < len(assigned):
-                    n_wid_inc = len(assigned) - np.shape(cutoffs)[1]
-                    cutoffs = np.append(
-                        cutoffs, np.empty((np.shape(cutoffs)[0], n_wid_inc)), axis=1
+                if np.shape(cutoff[mat_ind])[1] < len(assigned):
+                    n_wid = len(assigned)  # - np.shape(cutoff)[1]
+                    cells = np.append(
+                        cells[mat_ind], np.empty((tr_tally, n_wid)), axis=1
                     )
-                    n_wid = n_wid + n_wid_inc
+                    cutoff = np.append(
+                        cutoff[mat_ind], np.empty((tr_tally, n_wid)), axis=1
+                    )
+                    n_wid = np.shape(cutoff)[1]
 
-                if np.shape(cutoffs)[0] == c_row:
-                    cutoffs = np.append(cutoffs, np.empty((tr_tally, n_wid)), axis=0)
+                if np.shape(cutoff[mat_ind])[0] == c_row:  # go to next ind
+                    cells.append(np.empty((tr_tally, n_wid)))
+                    cutoff.append(np.empty((tr_tally, n_wid)))
+                    mat_ind += 1
+                    c_row_total += c_row
+                    c_row = 0
 
                 # transfer in our floats...
                 for k, v in assigned.items():
-                    cutoffs[c_row, ind] = v
+                    cells[mat_ind][c_row, ind] = k
+                    cutoff[mat_ind][c_row, ind] = v
                     ind += 1
+                    cell_list.update(k)
+
                 c_row += 1
-            self.logger.info(f"Just completed fov_{f:0>4}, current c_row {c_row}")
+            self.logger.info(
+                f"Just completed fov_{f:0>4}, mat number {mat_ind}, current c_row {c_row + c_row_total}"
+            )
+
+        # now merge the lists, if we need to
+        combined = np.empty((0, n_wid))
+        for c in cells:
+            combined = np.append(combined, c, axis=0)
+        del cells
+        cells = combined
+
+        combined_cutoff = np.empty((0, n_wid))
+        for c in cutoff:
+            combined_cutoff = np.append(combined_cutoff, c, axis=0)
+        del cutoff
+        cutoff = combined_cutoff
 
         assigned_tr = []
-        dupe_tr = []
-        num = 100  # resolution for estimate
-        rang = np.linspace(0.1, 1, num=num)
+        cell_dist = []
+        num = 60  # resolution for estimate
+        rang = np.linspace(0.01, 0.60, num=num)
 
         for thresh in rang:
-            assd = cutoffs > thresh
-            assigned_tr.append(np.nansum(assd))
-            dupe_tr.append(np.nansum(assd[np.nansum(assd, axis=1) > 1]))
+            # this is going to be a bit slower but whatever
+            this_tr = 0
+            this_cells = []
+            for i in range(len(cells)):
+                cell = self.assign_to_cell(
+                    {cells[i][j]: cutoff[i][j] for j in range(len(cells[i]))}, thresh
+                )
+                if cell is not None:
+                    this_tr += 1
+                    this_cells.append(cell)
 
-        dif = np.diff(np.diff(dupe_tr))
+            assigned_tr.append(this_tr)
+
+            # now some basic filtering like we do when clustering
+            # remove cells that do not reach a specific transcript count
+            min_count = 10
+
+            counts = Counter(this_cells)
+            tally = 0
+            for k, v in counts.items():
+                if k == 0.0:
+                    continue
+                if v > min_count:
+                    tally += 1
+
+            cell_dist.append(tally)
+
+        dif1 = np.diff(cell_dist)
+        dif2 = np.diff(dif1)
 
         if show_plots:
             fig, ax = plt.subplots()
-            im = ax.scatter(assigned_tr, dupe_tr, c=rang)
+            im = ax.scatter(assigned_tr, cell_dist, c=rang)
             # ax.set_xscale("log")
             # ax.set_yscale("log")
             ax.set_xlabel("Total transcripts assigned")
-            ax.set_ylabel("Number of transcripts assigned to more than one cell")
+            ax.set_ylabel(f"Number of cells with {min_count} transcripts assigned")
             fig.colorbar(im, ax=ax)
             plt.show(block=False)
 
             fig, ax = plt.subplots()
-            im = ax.scatter(assigned_tr[2:], dif, c=rang[2:])
+            im = ax.scatter(assigned_tr[1:], dif1, c=rang[1:])
             # ax.set_xscale("log")
             # ax.set_yscale("log")
             ax.set_xlabel("Total transcripts assigned")
             ax.set_ylabel(
-                "Number of transcripts assigned to more than one cell, 2nd derivative"
+                f"Number of cells with {min_count} transcripts assigned, 1st derivative"
             )
             fig.colorbar(im, ax=ax)
             plt.show(block=False)
 
-        percentile = np.argmax(dif)
+            fig, ax = plt.subplots()
+            im = ax.scatter(assigned_tr[2:], dif2, c=rang[2:])
+            # ax.set_xscale("log")
+            # ax.set_yscale("log")
+            ax.set_xlabel("Total transcripts assigned")
+            ax.set_ylabel(
+                f"Number of cells with {min_count} transcripts assigned, 2nd derivative"
+            )
+            fig.colorbar(im, ax=ax)
+            plt.show(block=False)
 
-        ass_per = [dupe_tr[i] / assigned_tr[i] * 100 for i in range(num)]
+        percentile = np.argmax(dif2)
+
+        ass_per = [cell_dist[i] / assigned_tr[i] * 100 for i in range(num)]
         fir = ass_per.index(min(ass_per))
 
         if show_plots:
@@ -585,12 +687,12 @@ class SoftAssigner:
             "aggresive": {
                 "threshold": rang[percentile + 2],
                 "total_assigned": assigned_tr[percentile + 2],
-                "multi_assigned": dupe_tr[percentile + 2],
+                "unique_cells": cell_dist[percentile + 2],
             },
             "conservative": {
                 "threshold": rang[fir],
                 "total_assigned": assigned_tr[fir],
-                "multi_assigned": dupe_tr[fir],
+                "unique_cells": cell_dist[fir],
             },
         }
 
@@ -607,15 +709,15 @@ class SoftAssigner:
             tr = pd.read_csv(self.complete_csv_name.format(f))
             for i, row in tr.iterrows():
                 assigned = ast.literal_eval(row["cell_ids"])
-                for k, v in assigned.items():
-                    if min_thresh is None or float(v) > min_thresh:
-                        if k in cxg_dict.keys():
-                            if row["gene"] in cxg_dict[k].keys():
-                                cxg_dict[k][row["gene"]] += 1
-                            else:
-                                cxg_dict[k][row["gene"]] = 1
+                k = self.assign_to_cell(assigned, min_thresh)
+                if k is not None:
+                    if k in cxg_dict.keys():
+                        if row["gene"] in cxg_dict[k].keys():
+                            cxg_dict[k][row["gene"]] += 1
                         else:
-                            cxg_dict[k] = {row["gene"]: 1}
+                            cxg_dict[k][row["gene"]] = 1
+                    else:
+                        cxg_dict[k] = {row["gene"]: 1}
             # print(cxg_dict)
             del tr
             self.logger.info(f"[{datetime.now()}] completed reading in fov_{f:0>4}.")
@@ -630,18 +732,20 @@ class SoftAssigner:
         adata.obs["y_coords"] = pd.DataFrame(np.zeros((len(adata), 1)))
         adata.obs["z_coords"] = pd.DataFrame(np.zeros((len(adata), 1)))
 
-        with np.printoptions(threshold=np.inf):
+        with pd.set_option("display.max_seq_items", None):
             self.logger.debug(f"All valid cell ids: {adata.obs_names}")
 
         for f in fovs:
             if Path(self.im_loc.format(f)).is_file():
                 im = skimage.io.imread(self.im_loc.format(f))
-                im = clear_border(im)
+                im = remove_border(im)
                 with Pool(self.pool_size) as pool:
                     results = pool.starmap(getContour, zip(repeat(im), np.unique(im)))
-                all_contours = {i - 1: contour for contour, i in results}
+                # THIS is where we account for the fact that image IDs are 1-indexed
+                all_contours = {cs[1] - 1: cs[0] for cs in results if cs is not None}
+
                 for k, v in all_contours.items():
-                    if k == 0 or str(k) not in adata.obs_names:  # don't run on bg
+                    if k == -1 or str(k) not in adata.obs_names:  # don't run on bg
                         self.logger.debug(f"[{datetime.now()}] cell id {k} not valid.")
                         continue
                     moments = []
@@ -731,7 +835,7 @@ class SoftAssigner:
         results = {}
         dupe_ass = {}
         tr_writer = open(f"{self.complete_loc}{datetime.now()}_changed_trs.csv", "w")
-        tr_writer.write("transcript ID, cell ID\n")
+        tr_writer.write("transcript ID,cell ID\n")
 
         if conf_thresh is None:
             conf_thresh = self.conf_thresh
@@ -751,6 +855,7 @@ class SoftAssigner:
                     continue
 
                 asst = ast.literal_eval(row["cell_ids"])
+                # keys are cell ids, values are assigned likelihoods
                 if len(asst.keys()) > 1:
                     # first, filter out any cell ids that got filtered before labelling
                     elg_cells = [k for k in asst.keys() if k in adata.obs.index]
@@ -914,7 +1019,7 @@ class SoftAssigner:
                                             continue
                                         temp = self.df_comp[gene].copy()
                                         temp = temp.loc[types]
-                                        if len(conf_inds[cell_ind[0]]) > "0":
+                                        if len(conf_inds[cell_ind[0]]) > 0:
                                             conf_inds[cell_ind[0]] = pd.concat(
                                                 [conf_inds[cell_ind[0]], temp], axis=1
                                             )
@@ -1028,7 +1133,7 @@ class SoftAssigner:
                         for ge in reass_inds[key_ref[v]]:
                             all_reass[ge] = winning_combo[v]
                             if winning_combo[v] != "Original":
-                                tr_writer.write(f" {ge}, {all_reass[ge]}\n")
+                                tr_writer.write(f"{ge},{all_reass[ge]}\n")
                         if winning_combo[v] != "Original":
                             results[key_ref[v]] = extract_celltype(
                                 cats, adata.obs.loc[[winning_combo[v]]]
