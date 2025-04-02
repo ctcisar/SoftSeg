@@ -10,6 +10,7 @@ from datetime import datetime
 from itertools import repeat
 from multiprocessing import Pool
 from pathlib import Path
+from tqdm import tqdm
 
 import anndata as ad
 import cv2
@@ -76,7 +77,7 @@ def remove_border(im):
         removed.update(set(np.unique(z)) - set(np.unique(result[-1])))
 
     result = np.array(result)
-    print(np.shape(result))
+    #print(np.shape(result))
 
     for r in removed:
         result[result == r] = 0
@@ -700,6 +701,10 @@ class SoftAssigner:
         """
         Converts all completed analyses to adata format.
 
+        Note that this involves converting the transcript table into
+        a cell by gene matrix. For this reason, min_thresh is used
+        to decide which of the multiple possible assignments are valid.
+
         fov_locs: dict containing the start positions of each fov
         min_thresh: transcripts with value lower than this will not be retained.
         """
@@ -732,7 +737,7 @@ class SoftAssigner:
         adata.obs["y_coords"] = pd.DataFrame(np.zeros((len(adata), 1)))
         adata.obs["z_coords"] = pd.DataFrame(np.zeros((len(adata), 1)))
 
-        with pd.set_option("display.max_seq_items", None):
+        with pd.option_context("display.max_seq_items", None):
             self.logger.debug(f"All valid cell ids: {adata.obs_names}")
 
         for f in fovs:
@@ -814,7 +819,7 @@ class SoftAssigner:
         self.df_comp = df_normed
 
     def evaluate_overlapping_regions(
-        self, adata, cats, sel_fovs=None, min_thresh=None, conf_thresh=None
+        self, adata, cats, sel_fovs=None, min_thresh=None
     ):
         def extract_celltype(cats, row):
             this_type = [
@@ -837,8 +842,9 @@ class SoftAssigner:
         tr_writer = open(f"{self.complete_loc}{datetime.now()}_changed_trs.csv", "w")
         tr_writer.write("transcript ID,cell ID\n")
 
-        if conf_thresh is None:
-            conf_thresh = self.conf_thresh
+        dict_loc = f"{self.complete_loc}{datetime.now()}_overlap_eval.pydict"
+
+        fov_tally = 0
 
         for f in sel_fovs:
             dupe_ass[f] = {}
@@ -849,56 +855,66 @@ class SoftAssigner:
             self.logger.info(
                 f"[{datetime.now()}] evaluate_overlapping_regions starting fov_{f:0>4}..."
             )
-            for r, row in tr.iterrows():
-                # omit blanks
-                if "lank" in row["gene"]:
-                    continue
 
-                asst = ast.literal_eval(row["cell_ids"])
-                # keys are cell ids, values are assigned likelihoods
-                if len(asst.keys()) > 1:
-                    # first, filter out any cell ids that got filtered before labelling
-                    elg_cells = [k for k in asst.keys() if k in adata.obs.index]
-                    self.logger.debug(f"{asst} {elg_cells}")
+            print(f"Starting fov_{f:0>4} ({100*fov_tally/len(sel_fovs):.2f}%):")
+            print("\treading transcripts...")
+            fov_tally += 1
 
-                    # now, select for transcripts above threshold
-                    # these are the only things eligible to be assigned to
-                    pos_keys = tuple(
-                        sorted(
-                            [
-                                k
-                                for k in elg_cells
-                                if (min_thresh is None or asst[k] > min_thresh)
-                            ]
+            # first step: identify regions where transcripts have the potential to be
+            # assigned to more than one cell.
+            with tqdm(total=len(tr)) as pbar:
+                for r, row in tr.iterrows():
+                    pbar.update(1)
+
+                    # omit blanks
+                    if "lank" in row["gene"]:
+                        continue
+
+                    asst = ast.literal_eval(row["cell_ids"])
+                    # keys are cell ids, values are assigned likelihoods
+                    if len(asst.keys()) > 1:
+                        # first, filter out any cell ids that got filtered before labelling
+                        elg_cells = [k for k in asst.keys() if k in adata.obs.index]
+                        self.logger.debug(f"{asst} {elg_cells}")
+
+                        # now, select for transcripts above threshold
+                        # these are the only things eligible to be assigned to
+                        pos_keys = tuple(
+                            sorted(
+                                [
+                                    k
+                                    for k in elg_cells
+                                    if (min_thresh is None or asst[k] > min_thresh)
+                                ]
+                            )
                         )
-                    )
 
-                    # if it's not eligible to be assigned to anything, we don't care...
-                    if len(pos_keys) == 0:
-                        continue
+                        # if it's not eligible to be assigned to anything, we don't care...
+                        if len(pos_keys) == 0:
+                            continue
 
-                    # next, see if this is a comparison that we even care about
-                    # need at least one of these cells to be a different type
-                    types = [
-                        extract_celltype(cats, adata.obs.loc[[i]]) for i in elg_cells
-                    ]
+                        # next, see if this is a comparison that we even care about
+                        # need at least one of these cells to be a different type
+                        types = [
+                            extract_celltype(cats, adata.obs.loc[[i]]) for i in elg_cells
+                        ]
 
-                    # we don't care if everything is the same type
-                    if len(set(types)) < 2:
-                        continue
+                        # we don't care if everything is the same type
+                        if len(set(types)) < 2:
+                            continue
 
-                    transc = (row["gene"], row["index"])
-                    tp = tuple(sorted(elg_cells))
-                    # OK NOW. we are looking to reassign transc to one of pos_keys
-                    # while we are looking at a comparison of anything in tp
+                        transc = (row["gene"], row["index"])
+                        tp = tuple(sorted(elg_cells))
+                        # OK NOW. we are looking to reassign transc to one of pos_keys
+                        # while we are looking at a comparison of anything in tp
 
-                    if tp not in dupe_ass[f].keys():
-                        dupe_ass[f][tp] = {}
+                        if tp not in dupe_ass[f].keys():
+                            dupe_ass[f][tp] = {}
 
-                    if pos_keys not in dupe_ass[f][tp].keys():
-                        dupe_ass[f][tp][pos_keys] = [transc]
-                    else:
-                        dupe_ass[f][tp][pos_keys].append(transc)
+                        if pos_keys not in dupe_ass[f][tp].keys():
+                            dupe_ass[f][tp][pos_keys] = [transc]
+                        else:
+                            dupe_ass[f][tp][pos_keys].append(transc)
 
             # pruning step: reduce entries where not all comparisons are made
             # this is a lot more complicated with n possible comparisons...
@@ -907,18 +923,21 @@ class SoftAssigner:
 
             to_del = []
             to_add = {}
-            for k, v in dupe_ass[f].items():
-                # remove comparisons where there are no overlapping possible cell assignments
-                if list(set([len(i) for i in v.keys()])) == [1]:
-                    to_del.append(k)
-                # if this can be better crammed inside a more specific comparison, do so.
-                if (
-                    max([len(i) for i in v.keys()]) == len(k) - 1
-                    and len([len(i) for i in v.keys() if i == len(k) - 1]) == 1
-                ):
-                    k_sel = [i for i in v.keys() if len(i) == len(k) - 1][0]
-                    to_add[k_sel] = k
-                    to_del.append(k)
+            print("\tpruning comparisons...")
+            with tqdm(total=len(dupe_ass[f])) as pbar:
+                for k, v in dupe_ass[f].items():
+                    pbar.update(1)
+                    # remove comparisons where there are no overlapping possible cell assignments
+                    if list(set([len(i) for i in v.keys()])) == [1]:
+                        to_del.append(k)
+                    # if this can be better crammed inside a more specific comparison, do so.
+                    if (
+                        max([len(i) for i in v.keys()]) == len(k) - 1
+                        and len([len(i) for i in v.keys() if i == len(k) - 1]) == 1
+                    ):
+                        k_sel = [i for i in v.keys() if len(i) == len(k) - 1][0]
+                        to_add[k_sel] = k
+                        to_del.append(k)
             for k, k_big in to_add.items():
                 for sm in dupe_ass[f][k].keys():
                     dupe_ass[f][k][sm].extend(dupe_ass[f][k_big][sm])
@@ -934,18 +953,20 @@ class SoftAssigner:
 
             # find and save all confident assignments, to avoid
             # repeated iteration for each pairing
+            print("\tidentifying confident transcripts...")
             conf_tr = {}
-            for r, row in tr.iterrows():
-                asst = ast.literal_eval(row["cell_ids"])
-                if len(asst.keys()) > 1:
-                    for key, v in asst.items():
-                        if (min_thresh is None or v > min_thresh) and "lank" not in row[
-                            "gene"
-                        ]:
-                            if key in conf_tr.keys():
-                                conf_tr[key].append(row["gene"])
+            with tqdm(total=len(tr)) as pbar:
+                for r, row in tr.iterrows():
+                    pbar.update(1)
+                    asst = ast.literal_eval(row["cell_ids"])
+                    if len(asst.keys()) > 1 and "lank" not in row["gene"]:
+                        target = self.assign_to_cell(asst, min_thresh)
+                        if target is not None:
+                            if target in conf_tr.keys():
+                                conf_tr[target].append(row["gene"])
                             else:
-                                conf_tr[key] = [row["gene"]]
+                                conf_tr[target] = [row["gene"]]
+
             # this only matters within an FOV
             all_reass_check = set()
 
@@ -955,198 +976,215 @@ class SoftAssigner:
 
             # start with 2 way comparisons, working our way up to n-way
             max_comp = max([len(k) for k in dupe_ass[f].keys()])
+            comp_tally = 0
 
-            for ln in range(2, max_comp + 1):
-                # print(l)
-                for k, gene_lis in dupe_ass[f].items():
-                    if len(k) != ln:
-                        continue
+            print("\tperforming n-way comparisons...")
 
-                    reass_inds = {}
+            with tqdm(total=len(dupe_ass[f])) as pbar:
+                for ln in range(2, max_comp + 1):
+                    # print(l)
+                    for k, gene_lis in dupe_ass[f].items():
+                        if len(k) != ln:
+                            continue
 
-                    # get our celltypes
-                    types = [extract_celltype(cats, adata.obs.loc[[i]]) for i in k]
+                        reass_inds = {}
 
-                    # need to go through and retrieve the confident transcripts
-                    conf_inds = []
-                    for v in range(ln):
-                        temp = []
-                        if k[v] in conf_tr.keys():
-                            for gene in conf_tr[k[v]]:
-                                if gene in self.df_comp.columns:
-                                    t = self.df_comp[gene].copy()
-                                    t = t.loc[types]
-                                    # t.name = f"{gene}_{types[l]}"
-                                    temp.append(t)
-                            conf_inds.append(pd.concat(temp, axis=1))
-                        else:
-                            conf_inds.append([])
+                        # get our celltypes
+                        types = [extract_celltype(cats, adata.obs.loc[[i]]) for i in k]
 
-                    amb_inds = {}
-                    for inds, genes in gene_lis.items():
-
-                        # treat genes only in one of these zones separately
-                        if len(inds) == 1:
-                            t = max([i for i in range(ln) if inds[0] == k[i]])
-                            for gene, index in genes:
-                                temp = self.df_comp[gene].copy()
-                                temp = temp.loc[types]
-                                if len(conf_inds[t]) > 0:
-                                    conf_inds[t] = pd.concat(
-                                        [conf_inds[t], temp], axis=1
-                                    )
-                                else:
-                                    conf_inds[t] = temp
-                        else:
-                            # this is the overlap zone
-                            amb_inds[inds] = []
-                            reass_inds[inds] = []
-                            # print(f"{inds} all genes: {genes}")
-                            for gene, index in genes:
-                                if (
-                                    gene in self.df_comp.columns
-                                ):  # possible for genes to get dropped in filtering
-                                    # if this has been reassigned elsewhere, go with that
-                                    if index in all_reass.keys():
-                                        c = all_reass[index]
-                                        cell_ind = [
-                                            ks for ks in range(len(k)) if k[ks] == c
-                                        ]
-                                        if len(cell_ind) != 1:
-                                            print(
-                                                f"Warning! Gene {index} has been assigned to {all_reass[index]}, which is not one of the eligible cells in this comparison!"
-                                            )
-                                            continue
-                                        temp = self.df_comp[gene].copy()
-                                        temp = temp.loc[types]
-                                        if len(conf_inds[cell_ind[0]]) > 0:
-                                            conf_inds[cell_ind[0]] = pd.concat(
-                                                [conf_inds[cell_ind[0]], temp], axis=1
-                                            )
-                                        else:
-                                            conf_inds[cell_ind[0]] = temp
-                                    else:
-                                        temp = self.df_comp[gene].copy()
-                                        temp = temp.loc[types]
-                                        amb_inds[inds].append(temp)
-                                        reass_inds[inds].append(index)
-
-                    ov_check = []
-                    for ind, v in reass_inds.items():
-                        ov_check.extend(v)
-                    overlap = set.intersection(all_reass_check, set(ov_check))
-                    if len(overlap) > 0:
-                        print(
-                            f"Warning! Transcripts {overlap} have already been reassigned!"
-                        )
-
-                    top_val = 0
-                    winning_combo = []
-
-                    print(amb_inds.keys())
-                    for combo in itertools.product(
-                        *[(*cellid, "Original") for cellid in amb_inds.keys()]
-                    ):
-                        sel_vals = {}
-                        for v in range(len(conf_inds)):
-                            if (
-                                len(conf_inds[v]) > 0
-                            ):  # not interested if there aren't any
-                                if hasattr(
-                                    conf_inds[v].values[v], "__len__"
-                                ):  # it's possible to just have one cell
-                                    sel_vals[k[v]] = list(conf_inds[v].values[v])
-                                else:
-                                    sel_vals[k[v]] = [conf_inds[v].values[v]]
-
-                        key_ref = list(amb_inds.keys())
-                        for v_tup in range(len(combo)):
-                            cell_ind = combo[v_tup]
-                            sel_keyset = key_ref[v_tup]
-                            if cell_ind != "Original":
-                                ind = list(sel_keyset).index(cell_ind)
-
-                                t_df = pd.concat(amb_inds[sel_keyset], axis=1)
-
-                                if cell_ind in sel_vals.keys():
-                                    n_val = t_df.values[ind]
-                                    if hasattr(n_val, "__len__"):
-                                        sel_vals[cell_ind].extend(n_val)
-                                    else:
-                                        sel_vals[cell_ind].append(n_val)
-                                else:
-                                    sel_vals[cell_ind] = [t_df.values[ind]]
+                        # need to go through and retrieve the confident transcripts
+                        conf_inds = []
+                        for v in range(ln):
+                            temp = []
+                            if k[v] in conf_tr.keys():
+                                for gene in conf_tr[k[v]]:
+                                    if gene in self.df_comp.columns:
+                                        t = self.df_comp[gene].copy()
+                                        t = t.loc[types]
+                                        # t.name = f"{gene}_{types[l]}"
+                                        temp.append(t)
+                                conf_inds.append(pd.concat(temp, axis=1))
                             else:
-                                for tr_tup in gene_lis[sel_keyset]:
-                                    tr_id = tr_tup[1]
-                                    row = tr.loc[tr["index"] == int(tr_id)]
-                                    if len(np.shape(im)) == 2:
-                                        one_cell_ind = (
-                                            im[row["y"] - 1, row["x"] - 1][0] - 1
+                                conf_inds.append([])
+
+                        amb_inds = {}
+                        for inds, genes in gene_lis.items():
+
+                            # treat genes only in one of these zones separately
+                            if len(inds) == 1:
+                                t = max([i for i in range(ln) if inds[0] == k[i]])
+                                for gene, index in genes:
+                                    temp = self.df_comp[gene].copy()
+                                    temp = temp.loc[types]
+                                    if len(conf_inds[t]) > 0:
+                                        conf_inds[t] = pd.concat(
+                                            [conf_inds[t], temp], axis=1
                                         )
                                     else:
-                                        one_cell_ind = (
-                                            im[
-                                                row["global_z"],
-                                                row["y"] - 1,
-                                                row["x"] - 1,
-                                            ][0]
-                                            - 1
-                                        )
-                                    if str(one_cell_ind) in list(sel_keyset):
-                                        ind = list(sel_keyset).index(str(one_cell_ind))
+                                        conf_inds[t] = temp
+                            else:
+                                # this is the overlap zone
+                                amb_inds[inds] = []
+                                reass_inds[inds] = []
+                                # print(f"{inds} all genes: {genes}")
+                                for gene, index in genes:
+                                    if (
+                                        gene in self.df_comp.columns
+                                    ):  # possible for genes to get dropped in filtering
+                                        # if this has been reassigned elsewhere, go with that
+                                        if index in all_reass.keys():
+                                            c = all_reass[index]
+                                            cell_ind = [
+                                                ks for ks in range(len(k)) if k[ks] == c
+                                            ]
+                                            if len(cell_ind) != 1:
+                                                self.logger.info(
+                                                    f"Warning! Gene {index} has been assigned to {all_reass[index]}, which is not one of the eligible cells in this comparison!"
+                                                )
+                                                continue
+                                            temp = self.df_comp[gene].copy()
+                                            temp = temp.loc[types]
+                                            if len(conf_inds[cell_ind[0]]) > 0:
+                                                conf_inds[cell_ind[0]] = pd.concat(
+                                                    [conf_inds[cell_ind[0]], temp], axis=1
+                                                )
+                                            else:
+                                                conf_inds[cell_ind[0]] = temp
+                                        else:
+                                            temp = self.df_comp[gene].copy()
+                                            temp = temp.loc[types]
+                                            amb_inds[inds].append(temp)
+                                            reass_inds[inds].append(index)
+
+                        ov_check = []
+                        for ind, v in reass_inds.items():
+                            ov_check.extend(v)
+                        overlap = set.intersection(all_reass_check, set(ov_check))
+                        if len(overlap) > 0:
+                            self.logger.info(
+                                f"Warning! Transcripts {overlap} have already been reassigned!"
+                            )
+
+                        top_val = 0
+                        winning_combo = []
+
+                        for combo in itertools.product(
+                            *[(*cellid, "Original") for cellid in amb_inds.keys()]
+                        ):
+                            sel_vals = {}
+                            for v in range(len(conf_inds)):
+                                if (
+                                    len(conf_inds[v]) > 0
+                                ):  # not interested if there aren't any
+                                    if hasattr(
+                                        conf_inds[v].values[v], "__len__"
+                                    ):  # it's possible to just have one cell
+                                        sel_vals[k[v]] = list(conf_inds[v].values[v])
                                     else:
-                                        if one_cell_ind > 0:
-                                            print(
-                                                f"Warning! Original cell assignment {one_cell_ind} for transcript {tr_id} not in possible comparison list {sel_keyset}!"
-                                            )
+                                        sel_vals[k[v]] = [conf_inds[v].values[v]]
+
+                            key_ref = list(amb_inds.keys())
+                            for v_tup in range(len(combo)):
+                                cell_ind = combo[v_tup]
+                                sel_keyset = key_ref[v_tup]
+                                if cell_ind != "Original":
+                                    ind = list(sel_keyset).index(cell_ind)
+                                    if len(amb_inds[sel_keyset]) == 0:
+                                        self.lgger.info(f"Combo {sel_keyset} has no ambiguous transcripts.")
                                         continue
 
-                                    if tr_tup[0] in self.df_comp.columns:
-                                        t_df = self.df_comp[tr_tup[0]].copy()
-                                        t_df = t_df.loc[types]
+                                    t_df = pd.concat(amb_inds[sel_keyset], axis=1)
 
-                                        if cell_ind in sel_vals.keys():
-                                            n_val = t_df.values[ind]
-                                            if hasattr(n_val, "__len__"):
-                                                sel_vals[cell_ind].extend(n_val)
-                                            else:
-                                                sel_vals[cell_ind].append(n_val)
+                                    if cell_ind in sel_vals.keys():
+                                        n_val = t_df.values[ind]
+                                        if hasattr(n_val, "__len__"):
+                                            sel_vals[cell_ind].extend(n_val)
                                         else:
-                                            sel_vals[cell_ind] = [t_df.values[ind]]
+                                            sel_vals[cell_ind].append(n_val)
+                                    else:
+                                        sel_vals[cell_ind] = [t_df.values[ind]]
+                                else:
+                                    for tr_tup in gene_lis[sel_keyset]:
+                                        tr_id = tr_tup[1]
+                                        row = tr.loc[tr["index"] == int(tr_id)]
+                                        if len(np.shape(im)) == 2:
+                                            one_cell_ind = (
+                                                im[row["y"] - 1, row["x"] - 1][0] - 1
+                                            )
+                                        else:
+                                            one_cell_ind = (
+                                                im[
+                                                    row["global_z"],
+                                                    row["y"] - 1,
+                                                    row["x"] - 1,
+                                                ][0]
+                                                - 1
+                                            )
+                                        if str(one_cell_ind) in list(sel_keyset):
+                                            ind = list(sel_keyset).index(str(one_cell_ind))
+                                        else:
+                                            if one_cell_ind > 0:
+                                                self.logger.info(
+                                                    f"Warning! Original cell assignment {one_cell_ind} for transcript {tr_id} not in possible comparison list {sel_keyset}!"
+                                                )
+                                            continue
 
-                        everything = [
-                            v for row in [v for k, v in sel_vals.items()] for v in row
-                        ]
-                        avg = np.average(everything)
+                                        if tr_tup[0] in self.df_comp.columns:
+                                            t_df = self.df_comp[tr_tup[0]].copy()
+                                            t_df = t_df.loc[types]
 
-                        # idk what causes the bug that requires this but...
-                        while hasattr(avg, "__len__"):
-                            avg = np.average(avg)
+                                            if cell_ind in sel_vals.keys():
+                                                n_val = t_df.values[ind]
+                                                if hasattr(n_val, "__len__"):
+                                                    sel_vals[cell_ind].extend(n_val)
+                                                else:
+                                                    sel_vals[cell_ind].append(n_val)
+                                            else:
+                                                sel_vals[cell_ind] = [t_df.values[ind]]
 
-                        if avg > top_val:
-                            winning_combo = combo
-                            top_val = avg
+                            everything = [
+                                v for row in [v for k, v in sel_vals.items()] for v in row
+                            ]
+                            avg = np.average(everything)
 
-                    key_ref = list(reass_inds.keys())
-                    for v in range(len(winning_combo)):
-                        for ge in reass_inds[key_ref[v]]:
-                            all_reass[ge] = winning_combo[v]
+                            # idk what causes the bug that requires this but...
+                            while hasattr(avg, "__len__"):
+                                avg = np.average(avg)
+
+                            if avg > top_val:
+                                winning_combo = combo
+                                top_val = avg
+
+                        comp_tally += 1
+                        pbar.update(1)
+                        # if comp_tally % 20 == 0:
+                        #     print(f"\t{comp_tally}/{len(dupe_ass[f])}")
+                        # print(amb_inds.keys())
+
+                        key_ref = list(reass_inds.keys())
+                        for v in range(len(winning_combo)):
+                            for ge in reass_inds[key_ref[v]]:
+                                all_reass[ge] = winning_combo[v]
+                                if winning_combo[v] != "Original":
+                                    tr_writer.write(f"{ge},{all_reass[ge]}\n")
                             if winning_combo[v] != "Original":
-                                tr_writer.write(f"{ge},{all_reass[ge]}\n")
-                        if winning_combo[v] != "Original":
-                            results[key_ref[v]] = extract_celltype(
-                                cats, adata.obs.loc[[winning_combo[v]]]
-                            )
-                        else:
-                            results[key_ref[v]] = "Original"
+                                results[key_ref[v]] = extract_celltype(
+                                    cats, adata.obs.loc[[winning_combo[v]]]
+                                )
+                            else:
+                                results[key_ref[v]] = "Original"
 
-                    # if a_vals.mean() > b_vals.mean():
-                    #    results[k] = gene_inds.index[0]
-                    #    all_reass.update({i:k[0] for i in reass_inds}) # gene ind : cell ind
+                        # if a_vals.mean() > b_vals.mean():
+                        #    results[k] = gene_inds.index[0]
+                        #    all_reass.update({i:k[0] for i in reass_inds}) # gene ind : cell ind
 
-                    for k, v in reass_inds.items():
-                        all_reass_check.update(set(v))
+                        for k, v in reass_inds.items():
+                            all_reass_check.update(set(v))
+
+                        # we'll just manually re-save this after each FOV finishes
+                        # in the event of error we'll still have something'
+                        with open(dict_loc, "w") as fl:
+                            fl.write(str(results))
 
         tr_writer.close()
         return results

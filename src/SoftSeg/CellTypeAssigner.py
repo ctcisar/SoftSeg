@@ -31,7 +31,11 @@ def download_lung_dataset(filepath):
 
 
 class CellTypeAssigner:
-    def __init__(self, adata_loc=None, adata=None, verbose=True):
+    def __init__(
+        self, ref_levels, ann_levels, adata_loc=None, adata=None, verbose=True
+    ):
+        self.ref_levels = ref_levels  # list of columns to look at for celltype labels in ref data
+        self.ann_levels = ann_levels  # list of columns to assign celltypes target adata
         if adata is not None:
             self.adata = adata
         elif adata_loc is not None:
@@ -50,6 +54,9 @@ class CellTypeAssigner:
             self.adata.write_h5ad(filename)
             print(f"Saved {filename}")
             return filename
+
+    def load_annotated_adata(self, loc):
+        self.adata = ad.read(loc)
 
     def filter_cells(self, adata=None, **kwargs):
         """
@@ -136,13 +143,23 @@ class CellTypeAssigner:
         else:
             return adata
 
-    def get_celltypes(self, ref_adata, annotation_level):
+    def get_celltypes(self, ref_adata, ref_level, target_type=None, ignored=[]):
+        # First, subset the reference data if target_type is provided
+        radata = ref_adata.copy()
+        if target_type is not None:
+            radata = radata[
+                np.isin(radata.obs[self.ref_levels[ref_level - 1]], [target_type])
+            ]
+            radata = radata[
+                ~np.isin(radata.obs[self.ref_levels[ref_level]], ignored)
+            ]
+
         # Remove unknown celltypes
-        radata = ref_adata[ref_adata.obs[annotation_level] != "Unknown"]
+        radata = radata[radata.obs[self.ref_levels[ref_level]] != "Unknown"]
 
         # Find marker genes for celltypes (using only genes shared with local data)
         radata = radata[:, np.isin(radata.var.index, self.adata.var.index)]
-        sc.tl.rank_genes_groups(radata, annotation_level, method="wilcoxon")
+        sc.tl.rank_genes_groups(radata, self.ref_levels[ref_level], method="wilcoxon")
         # sc.tl.filter_rank_genes_groups(radata, annotation_level)
         sc.tl.filter_rank_genes_groups(radata)
         marker_df = sc.get.rank_genes_groups_df(radata, group=None)
@@ -169,31 +186,51 @@ class CellTypeAssigner:
 
         if self.verbose:
             print(
-                f"celltypes present in single-cell reference: {Counter(radata.obs[annotation_level])}"
+                f"celltypes present in single-cell reference: {Counter(radata.obs[self.ref_levels[ref_level]])}"
             )
 
         self.pos_markers = pos_markers
         self.neg_markers = neg_markers
         self.celltypes = celltypes
+        self.level = ref_level
+        self.target = target_type
+        if self.target is not None:
+            adata = self.adata.copy()
+            adata = adata[adata.obs[self.ann_levels[self.level-1]] == self.target]
+            self.sub_adata = adata
+        else:
+            self.sub_adata = None
 
     def get_clusters(self, n_pcs=50, n_neighbors=25, res=0.5):
+        # if target is defined, only run this on a subset of the data
+        if self.target is not None:
+            adata = self.sub_adata
+        else:
+            adata = self.adata
+
         # Unsupervised clustering (nothing new here, just verifying that we're getting decent looking clusters)
-        sc.pp.pca(self.adata, svd_solver="arpack", n_comps=n_pcs, copy=False)
-        sc.pp.neighbors(self.adata, n_neighbors=n_neighbors, n_pcs=n_pcs)
-        sc.tl.umap(self.adata)
-        sc.tl.leiden(self.adata, resolution=res)
+        sc.pp.pca(adata, svd_solver="arpack", n_comps=n_pcs, copy=False)
+        sc.pp.neighbors(adata, n_neighbors=n_neighbors, n_pcs=n_pcs)
+        sc.tl.umap(adata)
+        sc.tl.leiden(adata, resolution=res)
 
     def plot_raw_clusters(self, only_dotplot=True):
-        sc.tl.dendrogram(self.adata, "leiden")
-        if not only_dotplot:
-            sc.pl.umap(self.adata, color=["leiden"], cmap="tab20")
+        # if target is defined, only run this on a subset of the data
+        if self.target is not None:
+            adata = self.sub_adata
+        else:
+            adata = self.adata
 
-            sc.pl.dendrogram(self.adata, "leiden")
+        sc.tl.dendrogram(adata, "leiden")
+        if not only_dotplot:
+            sc.pl.umap(adata, color=["leiden"], cmap="tab20")
+
+            sc.pl.dendrogram(adata, "leiden")
 
             plt.figure(figsize=(15, 9), constrained_layout=True, dpi=200)
 
-            for cluster in sorted(set(self.adata.obs["leiden"].astype(int))):
-                cluster_adata = self.adata[self.adata.obs["leiden"] == str(cluster)]
+            for cluster in sorted(set(adata.obs["leiden"].astype(int))):
+                cluster_adata = adata[adata.obs["leiden"] == str(cluster)]
                 plt.scatter(
                     cluster_adata.obs["x_coords"],
                     cluster_adata.obs["y_coords"],
@@ -214,7 +251,7 @@ class CellTypeAssigner:
 
         for celltype in sorted(self.celltypes):
             sc.pl.dotplot(
-                self.adata,
+                adata,
                 self.pos_markers[celltype][:20],
                 groupby="leiden",
                 dendrogram=True,
@@ -223,7 +260,7 @@ class CellTypeAssigner:
             plt.show(block=False)
 
             sc.pl.dotplot(
-                self.adata,
+                adata,
                 self.neg_markers[celltype][:20],
                 groupby="leiden",
                 dendrogram=True,
@@ -233,14 +270,19 @@ class CellTypeAssigner:
 
         plt.show()
 
-    def assign_cluster_celltypes(self, obs_level, assigned_clusters):
+    def assign_cluster_celltypes(self, assigned_clusters):
         """
         obs_level will be the name of the cell typing obs column in the adata.
 
         assigned_clusters is expected to be of format
             {"cell_type": [cluster int, cluster int, ...],...}
         """
-        num_leiden = len(set(self.adata.obs["leiden"]))
+        if self.target is not None:
+            adata = self.sub_adata
+        else:
+            adata = self.adata
+
+        num_leiden = len(set(adata.obs["leiden"]))
         clusters2types = {k: "Unassigned" for k in range(0, num_leiden)}
 
         for k1, v1 in clusters2types.items():
@@ -248,20 +290,31 @@ class CellTypeAssigner:
                 for i in v2:
                     clusters2types[int(i)] = k2
 
-        self.adata.obs[obs_level] = [
-            clusters2types[int(cluster)] for cluster in self.adata.obs["leiden"]
+        obs_level = self.ann_levels[self.level]
+
+        adata.obs[self.ann_levels[self.level]] = [
+            clusters2types[int(cluster)] for cluster in adata.obs["leiden"]
         ]
-        types = list(set(self.adata.obs[obs_level]))
+        types = list(set(adata.obs[obs_level]))
         type2int = {cell_type: x for x, cell_type in enumerate(types)}
-        self.adata.obs["int_type"] = [
-            type2int[cell_type] for cell_type in self.adata.obs[obs_level]
+        adata.obs["int_type"] = [
+            type2int[cell_type] for cell_type in adata.obs[obs_level]
         ]
 
-    def plot_assigned_clusters(self, obs_level):
+    def plot_assigned_clusters(self, level=None):
+        if self.target is not None:
+            adata = self.sub_adata
+        else:
+            adata = self.adata
+
         plt.figure(figsize=(15, 9), constrained_layout=True, dpi=200)
 
-        for celltype in sorted(set(self.adata.obs[obs_level])):
-            celltype_adata = self.adata[self.adata.obs[obs_level] == celltype]
+        if level is None:
+            obs_level = self.ann_levels[self.level]
+        else:
+            obs_level = self.ann_levels[level]
+        for celltype in sorted(set(adata.obs[obs_level])):
+            celltype_adata = adata[adata.obs[obs_level] == celltype]
             plt.scatter(
                 celltype_adata.obs["x_coords"],
                 celltype_adata.obs["y_coords"],
@@ -279,5 +332,12 @@ class CellTypeAssigner:
         plt.show(block=False)
 
         # UMAP
-        sc.pl.umap(self.adata, color=[obs_level], cmap="tab20")
+        sc.pl.umap(adata, color=[obs_level], cmap="tab20")
         plt.show()
+
+    def merge_target_adata(self):
+        # TODO: make this smarter so it modifies the cluster columns?'
+        if self.target is not None:
+            not_adata = self.adata[self.adata.obs[self.ann_levels[self.level-1]] != self.target]
+            self.adata = ad.concat([self.sub_adata, not_adata], join="outer", merge="same")
+            self.sub_adata = None
