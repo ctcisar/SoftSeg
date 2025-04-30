@@ -10,7 +10,6 @@ from datetime import datetime
 from itertools import repeat
 from multiprocessing import Pool
 from pathlib import Path
-from tqdm import tqdm
 
 import anndata as ad
 import cv2
@@ -24,6 +23,7 @@ import yaml
 from matplotlib.patches import Circle
 from skimage.measure import regionprops
 from skimage.segmentation import clear_border
+from tqdm import tqdm
 
 
 def sigm(x, x0=0, k=0.05):
@@ -77,12 +77,25 @@ def remove_border(im):
         removed.update(set(np.unique(z)) - set(np.unique(result[-1])))
 
     result = np.array(result)
-    #print(np.shape(result))
+    # print(np.shape(result))
 
     for r in removed:
         result[result == r] = 0
 
     return result
+
+
+def flatten(lis):
+    if all([not hasattr(e, "__len__") for e in lis]):
+        return lis
+    else:
+        target = []
+        for li in lis:
+            if not hasattr(li, "__len__"):
+                target.append(li)
+            else:
+                target.extend(flatten(li))
+        return target
 
 
 class SoftAssigner:
@@ -393,11 +406,14 @@ class SoftAssigner:
                             if cv2.pointPolygonTest(
                                 cnt[0], (row["x"] - 1, row["y"] - 1), True
                             )
-                            < -1 * max_dist  # if this assignment distance passes our threshold
+                            < -1
+                            * max_dist  # if this assignment distance passes our threshold
                             else dict(  # add this index to the dict of eligible assignments
                                 row["cell_ids"],
                                 **{
-                                    str(m - 1): self.decay_func(  # this is where we account for images being 1-indexed
+                                    str(
+                                        m - 1
+                                    ): self.decay_func(  # this is where we account for images being 1-indexed
                                         cv2.pointPolygonTest(
                                             cnt[0], (row["x"] - 1, row["y"] - 1), True
                                         )
@@ -436,11 +452,14 @@ class SoftAssigner:
                                 (row["x"] - 1, row["y"] - 1),
                                 True,
                             )
-                            < -1 * max_dist  # if this assignment is eligible by its zslice and also passes the threshold
+                            < -1
+                            * max_dist  # if this assignment is eligible by its zslice and also passes the threshold
                             else dict(  # add this index to the dict of eligible assignments
                                 row["cell_ids"],
                                 **{
-                                    str(m - 1): self.decay_func(  # this is where we account for images being 1-indexed
+                                    str(
+                                        m - 1
+                                    ): self.decay_func(  # this is where we account for images being 1-indexed
                                         cv2.pointPolygonTest(
                                             cntz[row["global_z"]],
                                             (row["x"] - 1, row["y"] - 1),
@@ -793,7 +812,7 @@ class SoftAssigner:
 
         return adata
 
-    def get_scoring_matrix(self, adata, cats):
+    def get_scoring_matrix(self, adata, cats, normed=True):
         """
         Need to run this before evaluate_overlapping_regions
         cats is the possible cell types as they are described in adata
@@ -810,17 +829,18 @@ class SoftAssigner:
             avgs[k] = np.average(v.X, axis=0)
 
         df_avg = pd.DataFrame.from_dict(avgs, orient="index", columns=adata.var.index)
-        norm_total = sum([len(x) for k, x in filtered.items()])
-        df_normed = df_avg.multiply(
-            [(norm_total - len(x)) / norm_total * 100 for x in filtered.values()],
-            axis=0,
-        )
+        if normed:
+            norm_total = sum([len(x) for k, x in filtered.items()])
+            df_normed = df_avg.multiply(
+                [(norm_total - len(x)) / norm_total * 100 for x in filtered.values()],
+                axis=0,
+            )
 
-        self.df_comp = df_normed
+            self.df_comp = df_normed
+        else:
+            self.df_comp = df_avg
 
-    def evaluate_overlapping_regions(
-        self, adata, cats, sel_fovs=None, min_thresh=None
-    ):
+    def evaluate_overlapping_regions(self, adata, cats, sel_fovs=None, min_thresh=None):
         def extract_celltype(cats, row):
             this_type = [
                 row[n].values[0] for n, m in cats.items() if row[n].values[0] in m
@@ -884,7 +904,9 @@ class SoftAssigner:
                                 [
                                     k
                                     for k in elg_cells
-                                    if (min_thresh is None or asst[k] > min_thresh)
+                                    # if (min_thresh is None or asst[k] > min_thresh)
+                                    # ^ this is from when we had a seperate threshold
+                                    # from the confident one. We never actually used it.
                                 ]
                             )
                         )
@@ -896,7 +918,8 @@ class SoftAssigner:
                         # next, see if this is a comparison that we even care about
                         # need at least one of these cells to be a different type
                         types = [
-                            extract_celltype(cats, adata.obs.loc[[i]]) for i in elg_cells
+                            extract_celltype(cats, adata.obs.loc[[i]])
+                            for i in elg_cells
                         ]
 
                         # we don't care if everything is the same type
@@ -958,8 +981,8 @@ class SoftAssigner:
             with tqdm(total=len(tr)) as pbar:
                 for r, row in tr.iterrows():
                     pbar.update(1)
-                    asst = ast.literal_eval(row["cell_ids"])
-                    if len(asst.keys()) > 1 and "lank" not in row["gene"]:
+                    if "lank" not in row["gene"]:
+                        asst = ast.literal_eval(row["cell_ids"])
                         target = self.assign_to_cell(asst, min_thresh)
                         if target is not None:
                             if target in conf_tr.keys():
@@ -972,6 +995,7 @@ class SoftAssigner:
 
             # if we don't have any comparisons, skip ahead...
             if len(dupe_ass[f].keys()) == 0:
+                print("\tno comparisons to be made, skipping FOV.")
                 continue
 
             # start with 2 way comparisons, working our way up to n-way
@@ -1046,7 +1070,8 @@ class SoftAssigner:
                                             temp = temp.loc[types]
                                             if len(conf_inds[cell_ind[0]]) > 0:
                                                 conf_inds[cell_ind[0]] = pd.concat(
-                                                    [conf_inds[cell_ind[0]], temp], axis=1
+                                                    [conf_inds[cell_ind[0]], temp],
+                                                    axis=1,
                                                 )
                                             else:
                                                 conf_inds[cell_ind[0]] = temp
@@ -1090,19 +1115,26 @@ class SoftAssigner:
                                 if cell_ind != "Original":
                                     ind = list(sel_keyset).index(cell_ind)
                                     if len(amb_inds[sel_keyset]) == 0:
-                                        self.lgger.info(f"Combo {sel_keyset} has no ambiguous transcripts.")
+                                        self.logger.info(
+                                            f"Combo {sel_keyset} has no ambiguous transcripts."
+                                        )
                                         continue
 
                                     t_df = pd.concat(amb_inds[sel_keyset], axis=1)
 
+                                    n_val = t_df.values[ind]
                                     if cell_ind in sel_vals.keys():
-                                        n_val = t_df.values[ind]
                                         if hasattr(n_val, "__len__"):
                                             sel_vals[cell_ind].extend(n_val)
                                         else:
                                             sel_vals[cell_ind].append(n_val)
                                     else:
-                                        sel_vals[cell_ind] = [t_df.values[ind]]
+                                        # THIS was what fixed the nested list problem
+                                        # TODO: figure out why this matters!!
+                                        if hasattr(n_val, "__len__"):
+                                            sel_vals[cell_ind] = n_val
+                                        else:
+                                            sel_vals[cell_ind] = [n_val]
                                 else:
                                     for tr_tup in gene_lis[sel_keyset]:
                                         tr_id = tr_tup[1]
@@ -1121,7 +1153,9 @@ class SoftAssigner:
                                                 - 1
                                             )
                                         if str(one_cell_ind) in list(sel_keyset):
-                                            ind = list(sel_keyset).index(str(one_cell_ind))
+                                            ind = list(sel_keyset).index(
+                                                str(one_cell_ind)
+                                            )
                                         else:
                                             if one_cell_ind > 0:
                                                 self.logger.info(
@@ -1133,23 +1167,31 @@ class SoftAssigner:
                                             t_df = self.df_comp[tr_tup[0]].copy()
                                             t_df = t_df.loc[types]
 
+                                            n_val = t_df.values[ind]
                                             if cell_ind in sel_vals.keys():
-                                                n_val = t_df.values[ind]
                                                 if hasattr(n_val, "__len__"):
                                                     sel_vals[cell_ind].extend(n_val)
                                                 else:
                                                     sel_vals[cell_ind].append(n_val)
                                             else:
-                                                sel_vals[cell_ind] = [t_df.values[ind]]
+                                                sel_vals[cell_ind] = [n_val]
 
                             everything = [
-                                v for row in [v for k, v in sel_vals.items()] for v in row
+                                v
+                                for row in [val for k, val in sel_vals.items()]
+                                for v in row
                             ]
-                            avg = np.average(everything)
 
-                            # idk what causes the bug that requires this but...
-                            while hasattr(avg, "__len__"):
-                                avg = np.average(avg)
+                            # Below should never be run, this bug has been isolated.
+                            if any([hasattr(e, "__len__") for e in everything]):
+                                print("Erroneous nested list!")
+                                for k, v in sel_vals.items():
+                                    if any([hasattr(m, "__len__") for m in v]):
+                                        print(f"{k}:{v}")
+
+                            # again, this flatten *shouldn't* matter, but leaving it in as a safety anyways.'
+                            everything = flatten(everything)
+                            avg = np.average(everything)
 
                             if avg > top_val:
                                 winning_combo = combo
@@ -1188,3 +1230,75 @@ class SoftAssigner:
 
         tr_writer.close()
         return results
+
+    def update_reassigned_segs(
+        self, changed_tr, ann_adata, min_thresh=None, ncol_name="reassigned"
+    ):
+        """
+        Given a dataframe of changed transcripts, create an updated anndata object
+        with the new gene by cell assignments. Also adds a column by the name of
+        ncol_name to each transcript table.
+        """
+
+        cxg_dict = {}
+        fovs = self.get_complete_fovs()
+
+        # first, we convert changed_tr from a dataframe to a dict,
+        # which saves us a TON of time on lookup later.
+
+        tr_dict = {}
+        for i, row in changed_tr.iterrows():
+            tr_dict[row["transcript ID"]] = row["cell ID"]
+
+        for f in fovs:
+            tr = pd.read_csv(self.complete_csv_name.format(f))
+            self.logger.info(f"[{datetime.now()}] starting fov_{f:0>4}...")
+
+            ncol = []
+            for i, row in tr.iterrows():
+                assigned = ast.literal_eval(row["cell_ids"])
+                k = self.assign_to_cell(assigned, min_thresh)
+
+                # if this is a transcript we reassigned, we need to update that
+                if row["index"] in tr_dict.keys():
+                    k = tr_dict[row["index"]]
+
+                if k is not None:
+                    k = int(k)  # reading in from ast will be a string
+                    ncol.append(k)
+                    if k in cxg_dict.keys():
+                        if row["gene"] in cxg_dict[k].keys():
+                            cxg_dict[k][row["gene"]] += 1
+                        else:
+                            cxg_dict[k][row["gene"]] = 1
+                    else:
+                        cxg_dict[k] = {row["gene"]: 1}
+                else:
+                    ncol.append(np.nan)
+            tr[ncol_name] = ncol
+
+            # save modified transcript table
+            tr.to_csv(self.complete_csv_name.format(f), sep=",")
+            del tr
+
+        cxg_df = pd.DataFrame.from_dict(cxg_dict, orient="index")
+        new_adata = ad.AnnData(cxg_df)
+
+        self.logger.debug(f"[{datetime.now()}] Converted new matrix to anndata.")
+
+        # now, cleaning it up to match the annotated anndata
+        col_oi = [col for col in ann_adata.obs.columns if "count" not in col]
+        sel_cells = []
+        for cell in new_adata.obs.index.to_list():
+            if cell in ann_adata.obs.index:
+                sel_cells.append(cell)
+
+        new_adata = new_adata[[cell in sel_cells for cell in new_adata.obs.index]]
+        for col in col_oi:
+            new_adata.obs[col] = pd.DataFrame(np.zeros((len(new_adata), 1)))
+            new_adata.obs.loc[sel_cells, col] = ann_adata.obs.loc[sel_cells, col]
+
+        dat = datetime.today().strftime("%Y%m%d")
+        filename = f"{self.complete_loc}cxg_adata_resegmented_{dat}.h5ad"
+        new_adata.write_h5ad(filename)
+        print(f"Saved {filename}")
