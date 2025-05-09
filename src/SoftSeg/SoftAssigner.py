@@ -1,10 +1,11 @@
 import ast
 import glob
-import itertools
 import logging
+import multiprocessing
 import random
 import time
 from collections import Counter
+from contextlib import closing
 from copy import deepcopy
 from datetime import datetime
 from itertools import repeat
@@ -19,8 +20,8 @@ import pandas as pd
 import parse
 import skimage
 import skimage.io
-import yaml
 from matplotlib.patches import Circle
+#  from memory_profiler import profile
 from skimage.measure import regionprops
 from skimage.segmentation import clear_border
 from tqdm import tqdm
@@ -716,32 +717,60 @@ class SoftAssigner:
             },
         }
 
-    def convert_to_adata(self, fov_locs, min_thresh=None):
+    def convert_to_adata(
+        self, min_thresh=None, assigned_col=None, fov_locs=None, prev_adata=None
+    ):
         """
         Converts all completed analyses to adata format.
 
-        Note that this involves converting the transcript table into
-        a cell by gene matrix. For this reason, min_thresh is used
-        to decide which of the multiple possible assignments are valid.
+        There are two different ways that two aspects of this can be run.
 
-        fov_locs: dict containing the start positions of each fov
-        min_thresh: transcripts with value lower than this will not be retained.
+        When determining what transcripts go into what cells:
+        - If assigned_col is provided, will pull the cell id from that column.
+        - Otherwise, self.assign_to_cell will be passed the "cell_ids" column.
+          If min_thresh is provided, that will be passed on to that method.
+
+        When labelling cells with location metadata:
+        - If prev_adata is provided, all columns from adata.obs that do not contain the
+          word "coun" will be transferred to the cell with the same id in the new adata.
+        - If fov_locs is provided, images will be loaded in and cell centroids will be
+          calculated from contours in that image.
+        Note that one of these two variables MUST be provided.
         """
+
+        if fov_locs is None and prev_adata is None:
+            raise ValueError("One of fov_locs or prev_adata must be provided.")
+
         cxg_dict = {}
         fovs = self.get_complete_fovs()
-        for f in fovs:
+
+        print("Reading cell by gene data from transcript tables.")
+        for f in tqdm(fovs):
             tr = pd.read_csv(self.complete_csv_name.format(f))
-            for i, row in tr.iterrows():
-                assigned = ast.literal_eval(row["cell_ids"])
-                k = self.assign_to_cell(assigned, min_thresh)
-                if k is not None:
-                    if k in cxg_dict.keys():
-                        if row["gene"] in cxg_dict[k].keys():
-                            cxg_dict[k][row["gene"]] += 1
-                        else:
-                            cxg_dict[k][row["gene"]] = 1
-                    else:
-                        cxg_dict[k] = {row["gene"]: 1}
+            self.logger.info(f"[{datetime.now()}] started reading in fov_{f:0>4}.")
+
+            if assigned_col is not None:
+                if assigned_col not in tr.columns:
+                    self.logger.info(f"{assigned_col} not in df for fov_{f:0>4}, skipping.")
+                    continue
+                tr = tr[~pd.isnull(tr[assigned_col])]
+                tallies = Counter(list(zip(tr["gene"], tr[assigned_col])))
+            else:
+                cell_col = tr.cell_ids.apply(lambda x: self.assign_to_cell(ast.literal_eval(x), min_thresh))
+                inds = cell_col.apply(lambda x: x is not None)
+                tallies = Counter(list(zip(tr["gene"][inds], cell_col[inds])))
+
+            for tup, tally in tallies.items():
+                gene, cell = tup
+                if cell == "other":
+                    # this technically shouldn't be possible but sometimes it happens
+                    # bug has since been patched but some old results still have this
+                    continue
+                cell = int(cell)
+                if cell in cxg_dict.keys():
+                    cxg_dict[cell][gene] = tally
+                else:
+                    cxg_dict[cell] = {gene: tally}
             # print(cxg_dict)
             del tr
             self.logger.info(f"[{datetime.now()}] completed reading in fov_{f:0>4}.")
@@ -750,66 +779,107 @@ class SoftAssigner:
         cxg_df
 
         adata = ad.AnnData(cxg_df)
-        adata.obs["fov"] = pd.DataFrame(np.zeros((len(adata), 1)))
-        adata.obs["size"] = pd.DataFrame(np.zeros((len(adata), 1)))
-        adata.obs["x_coords"] = pd.DataFrame(np.zeros((len(adata), 1)))
-        adata.obs["y_coords"] = pd.DataFrame(np.zeros((len(adata), 1)))
-        adata.obs["z_coords"] = pd.DataFrame(np.zeros((len(adata), 1)))
 
-        with pd.option_context("display.max_seq_items", None):
-            self.logger.debug(f"All valid cell ids: {adata.obs_names}")
+        if prev_adata is not None:
+            col_oi = [col for col in prev_adata.obs.columns if "count" not in col]
+            sel_cells = []
+            for cell in tqdm(adata.obs.index.to_list()):
+                if cell in prev_adata.obs.index:
+                    sel_cells.append(cell)
 
-        for f in fovs:
-            if Path(self.im_loc.format(f)).is_file():
-                im = skimage.io.imread(self.im_loc.format(f))
-                im = remove_border(im)
-                with Pool(self.pool_size) as pool:
-                    results = pool.starmap(getContour, zip(repeat(im), np.unique(im)))
-                # THIS is where we account for the fact that image IDs are 1-indexed
-                all_contours = {cs[1] - 1: cs[0] for cs in results if cs is not None}
+            adata = adata[[cell in sel_cells for cell in adata.obs.index]]
+            for col in col_oi:
+                adata.obs[col] = pd.DataFrame(np.zeros((len(adata), 1)))
+                adata.obs.loc[sel_cells, col] = prev_adata.obs.loc[sel_cells, col]
+        else:
+            adata.obs["fov"] = pd.DataFrame(np.zeros((len(adata), 1)))
+            adata.obs["size"] = pd.DataFrame(np.zeros((len(adata), 1)))
+            adata.obs["x_coords"] = pd.DataFrame(np.zeros((len(adata), 1)))
+            adata.obs["y_coords"] = pd.DataFrame(np.zeros((len(adata), 1)))
+            adata.obs["z_coords"] = pd.DataFrame(np.zeros((len(adata), 1)))
 
-                for k, v in all_contours.items():
-                    if k == -1 or str(k) not in adata.obs_names:  # don't run on bg
-                        self.logger.debug(f"[{datetime.now()}] cell id {k} not valid.")
-                        continue
-                    moments = []
-                    for n in range(len(v)):
-                        if len(v[n]) > 0:
-                            moments.append(cv2.moments(v[n][0]))
-                        else:
-                            moments.append({"m00": 0, "m01": 0, "m10": 0})
+            with pd.option_context("display.max_seq_items", None):
+                self.logger.debug(f"All valid cell ids: {adata.obs_names}")
 
-                    total_size = sum([n["m00"] for n in moments])
-
-                    adata.obs.loc[adata.obs.index.isin([str(k)]), "fov"] = f
-                    adata.obs.loc[adata.obs.index.isin([str(k)]), "size"] = total_size
-                    if total_size != 0:
-                        adata.obs.loc[adata.obs.index.isin([str(k)]), "x_coords"] = (
-                            int(sum([n["m10"] for n in moments]) / total_size)
-                            + fov_locs[f]["x"][0]
+            print("Finding cell centroid data and copying to anndata object")
+            for f in tqdm(fovs):
+                if Path(self.im_loc.format(f)).is_file():
+                    im = skimage.io.imread(self.im_loc.format(f))
+                    im = remove_border(im)
+                    with Pool(self.pool_size) as pool:
+                        results = pool.starmap(
+                            getContour, zip(repeat(im), np.unique(im))
                         )
-                        adata.obs.loc[adata.obs.index.isin([str(k)]), "y_coords"] = (
-                            int(sum([n["m01"] for n in moments]) / total_size)
-                            + fov_locs[f]["y"][0]
+                    # THIS is where we account for the fact that image IDs are 1-indexed
+                    all_contours = {
+                        cs[1] - 1: cs[0] for cs in results if cs is not None
+                    }
+
+                    for k, v in all_contours.items():
+                        if k == -1 or str(k) not in adata.obs_names:  # don't run on bg
+                            self.logger.debug(
+                                f"[{datetime.now()}] cell id {k} not valid."
+                            )
+                            continue
+                        moments = []
+                        for n in range(len(v)):
+                            if len(v[n]) > 0:
+                                moments.append(cv2.moments(v[n][0]))
+                            else:
+                                moments.append({"m00": 0, "m01": 0, "m10": 0})
+
+                        total_size = sum([n["m00"] for n in moments])
+
+                        adata.obs.loc[adata.obs.index.isin([str(k)]), "fov"] = f
+                        adata.obs.loc[adata.obs.index.isin([str(k)]), "size"] = (
+                            total_size
                         )
-                        adata.obs.loc[adata.obs.index.isin([str(k)]), "z_coords"] = (
-                            sum([moments[ln]["m00"] * ln for ln in range(len(moments))])
-                            / total_size
-                        )
-                    # print(adata[str(k)].obs)
-                    del moments
-                del all_contours
-                del im
-                self.logger.info(
-                    f"[{datetime.now()}] completed converting fov_{f:0>4}."
-                )
-            else:
-                self.logger.info(f"[{datetime.now()}] skipped converting fov_{f:0>4}.")
+                        if total_size != 0:
+                            adata.obs.loc[
+                                adata.obs.index.isin([str(k)]), "x_coords"
+                            ] = (
+                                int(sum([n["m10"] for n in moments]) / total_size)
+                                + fov_locs[f]["x"][0]
+                            )
+                            adata.obs.loc[
+                                adata.obs.index.isin([str(k)]), "y_coords"
+                            ] = (
+                                int(sum([n["m01"] for n in moments]) / total_size)
+                                + fov_locs[f]["y"][0]
+                            )
+                            adata.obs.loc[
+                                adata.obs.index.isin([str(k)]), "z_coords"
+                            ] = (
+                                sum(
+                                    [
+                                        moments[ln]["m00"] * ln
+                                        for ln in range(len(moments))
+                                    ]
+                                )
+                                / total_size
+                            )
+                        # print(adata[str(k)].obs)
+                        del moments
+                    del all_contours
+                    del im
+                    self.logger.info(
+                        f"[{datetime.now()}] completed converting fov_{f:0>4}."
+                    )
+                else:
+                    self.logger.info(
+                        f"[{datetime.now()}] skipped converting fov_{f:0>4}."
+                    )
 
         adata.X = np.nan_to_num(adata.X)
 
-        adata.write(f"{self.complete_loc}cxg_adata.h5ad")
+        dat = datetime.today().strftime("%Y%m%d")
+        filename = f"{self.complete_loc}cxg_adata_{dat}"
+        if assigned_col is not None:
+            filename += "_resegmented"
+        filename += ".h5ad"
 
+        adata.write(filename)
+        print(f"Saved {filename}")
         return adata
 
     def get_scoring_matrix(self, adata, cats, normed=True):
@@ -819,6 +889,8 @@ class SoftAssigner:
         formatted as
         { "column name":["cell type", "cell type"], ...}
         """
+        all_avg = np.average(adata.X, axis=0)
+
         filtered = {}
         for k, v in cats.items():
             for cat in v:
@@ -827,6 +899,9 @@ class SoftAssigner:
         avgs = {}
         for k, v in filtered.items():
             avgs[k] = np.average(v.X, axis=0)
+
+        filtered["other"] = [0] * len(adata.X)
+        avgs["other"] = all_avg
 
         df_avg = pd.DataFrame.from_dict(avgs, orient="index", columns=adata.var.index)
         if normed:
@@ -840,465 +915,528 @@ class SoftAssigner:
         else:
             self.df_comp = df_avg
 
-    def evaluate_overlapping_regions(self, adata, cats, sel_fovs=None, min_thresh=None):
-        def extract_celltype(cats, row):
-            this_type = [
-                row[n].values[0] for n, m in cats.items() if row[n].values[0] in m
-            ]
-            if len(this_type) > 1:
-                print(
-                    f"Warning! Cell {row.index} has multiple valid celltypes: {this_type}. Discarding..."
-                )
-                return
-            if len(this_type) > 0:
-                return this_type[0]
+        # generating cell_to_type dict, while we have our hands on cats
+        self.cell_to_type = {}  # key: cell ID, value: cell type
+        self.tr_to_gene = {}  # key: transcript ID, value: gene name
+        for r, row in adata.obs.iterrows():
+            for key_type, cell_types in cats.items():
+                for cell_type in cell_types:
+                    if row[key_type] == cell_type:
+                        self.cell_to_type[r] = cell_type
 
+    def score_tr_assignment(self, assignment):
+        score = 0
+        for cell, trs in assignment.items():
+            # it's possible to have untyped cells in a comparison
+            # if it is untyped, treat it as an "average" cell.
+            if cell in self.cell_to_type.keys():
+                cell_type = self.cell_to_type[cell]
+            else:
+                cell_type = "other"
+            for tr in trs:
+                # there may be genes that do not contribute to score
+                # (ie: blanks)
+                # TODO: add optional holdout feature here?
+                gene = self.tr_to_gene[tr]
+                if gene in self.df_comp:
+                    score += self.df_comp[gene][cell_type]
+        return score
+
+    def trs_at_thresh(self, thresh, sel_cells, todo_trs, all_trs, sel_index=0):
+        """
+        Given a set of ambiguous transcripts and their relative assignment scores,
+        figure out which transcripts should belong to which members of sel_cells at a given
+        threshold value for a given "primary cell".
+
+        thresh: float, given threshold value
+        sel_cells: a list of cells, matches the keys in todo_trs
+        todo_trs: dict: key: cell id
+                  value: np array; each row is a transcript
+                        [:,0] -> transcript IDs
+                        [:,1] -> assigment score
+        all_trs: pandas dataframe, raw reading in the saved csv file
+        sel_index: the index in sel_cells that the thresh should apply to.
+                   by default, we assume the 0th element.
+
+        RETURNS: dict: key: cell id
+                     value: list of transcript IDs
+        """
+
+        # we're going to be destroying this object,
+        # don't want to cause issues outside the scope of this function
+        sel_cells = sel_cells.copy()
+
+        i_cell = str(sel_cells[sel_index])
+        sel_cells.remove(
+            sel_cells[sel_index]
+        )  # sel_cells is now the other cells we need to look at
+        result = {}
+
+        # find set of transcripts that are beneat threshold for first sel_cell
+        i_trs = list(todo_trs[i_cell][todo_trs[i_cell][:, 1] > thresh][:, 0])
+        result[i_cell] = i_trs
+        assigned = i_trs.copy()
+
+        # Now we start to do slow stuff if there's more than two in the comparison...
+        # For each of the remaining cell ids, repeat threshold inversion
+        # (ie find the transcript with the lowest score assigned to previous cell,
+        # then get the value for the next cell on that same transcript,
+        # use this threshold to find the next set of candidates)
+        # and assign transcripts that are still unclaimed
+        while len(sel_cells) > 1:
+            # find transcript with lowest assignment score for prev cell
+            min_tr = todo_trs[i_cell][np.argmin(todo_trs[i_cell][:, 1]), 0]
+            min_assigned = ast.literal_eval(
+                all_trs[all_trs["index"] == min_tr]["cell_ids"].values[0]
+            )
+
+            # get the value for the next thresh
+            c_cell = str(sel_cells[0])
+            if c_cell == "other":
+                print(f"FATAL PROBLEM.\nsel_cells {sel_cells}\ntodo_trs {todo_trs}")
+            inv_thresh = min_assigned[c_cell]
+
+            # take slice of transcripts that are above this new threshold
+            interim_result = list(
+                todo_trs[c_cell][todo_trs[c_cell][:, 1] > inv_thresh][:, 0]
+            )
+
+            # remove items that have been assigned already
+            interim_result = [tr for tr in interim_result if tr not in assigned]
+            assigned.extend(interim_result)
+
+            result[c_cell] = interim_result
+
+            i_cell = c_cell
+            sel_cells.remove(sel_cells[0])
+
+        # for the last cell, just assign everything that's left
+        last_cell = str(sel_cells[0])
+        last_trs = list(todo_trs[last_cell][:, 0])
+        result[last_cell] = [tr for tr in last_trs if tr not in assigned]
+
+        return result
+
+    def dict_merge(self, d1, d2, inds):
+        """
+        Makes addition of two dicts of format
+           key: (index)
+           value: list
+        by looking up inds in both dicts and concatenating their respective lists
+        """
+        result = {}
+        for i in inds:
+            list1 = d1.get(i)
+            list2 = d2.get(i)
+            if list1 is not None:
+                if list2 is not None:
+                    result[i] = list1 + list2
+                else:
+                    result[i] = list1
+            elif list2 is not None:
+                result[i] = list2
+        return result
+
+    def trs_at_default(self, todo_trs):
+        """
+        Given a list of unconfident transcripts, return the assignments as they would be performed under
+        strict segmentation (ie, inside the original image boundaries). Basically: assigns all transcripts
+        with a assignment score > 0.5.
+
+        RETURNS: dict: key: cell id
+                     value: list of transcript IDs
+        """
+        result = {}
+        for cell, mat in todo_trs.items():
+            interim_result = mat[mat[:, 1] >= 0.5][:, 0]
+            result[cell] = list(interim_result)
+        # in the "default" case for a one-cell comparison, we need to spoof the "other" cell
+        if len(todo_trs.keys()) == 1:
+            cell = list(todo_trs.keys())[0]
+            interim_result = todo_trs[cell][todo_trs[cell][:, 1] < 0.5][:, 0]
+            result["other"] = list(interim_result)
+        return result
+
+    def evaluate_overlapping_regions_single_fov(
+        self,
+        f,
+        min_thresh=None,
+        default_thresh=5,
+        only_tagged_cells=None,
+        use_conf_trs=False,
+        use_other_cells=False,
+        assigned_col="assignment",
+        omit_blanks=False,
+        disable_tqdm=False,
+    ):
+        """
+        Scores and re-assigns border region transcripts for a single FOV.
+        f (int): current FOV
+        default_thresh (float): new segmentation must out-score original segmentation
+            by a factor of this much in order to be considered "better".
+        min_thresh (float): threshold to be used for confident transcript identification
+        only_tagged_cells (list): If provided, only cells in this list will be considered for re-evaluation.
+        use_conf_trs (bool): If true, confident transcripts will be added to each cell
+            when scoring transcript assignments. If false, only ambiguous transcripts will
+            be used. NOTE: Setting this to True causes a non-trivial slowdown.
+        assigned_col (string): The name of the column for the new assignment to be added to
+            for a given FOV's transcript table.
+        omit_blanks (bool): if True, all blanks will be categorically ignored. Note that you
+            may not want to ignore blanks in cell assignment if you want to quantify
+            any kind of spatial error.
+        disable_tqdm (bool): if True, this method will not print output or  create
+            its own pbar entities.
+        """
+        tr = pd.read_csv(self.complete_csv_name.format(f), index_col=0)
+        if assigned_col in tr.columns:
+            self.logger.info(f"[{datetime.now()}] skipping fov_{f:0>4}, {assigned_col} already present")
+            return
+
+        self.logger.info(
+            f"[{datetime.now()}] evaluate_overlapping_regions starting fov_{f:0>4}..."
+        )
+
+        conf_trs = {}  # key: cell, value: list of transcript ids
+        unconf_trs = {}
+        # key: (tuple of possible cell assignments)
+        # value: dict
+        #        key: cell
+        #        value: list of (transcript id, gradient value)
+        #               ^ will be converted to np.array later
+
+        skip_cached = []  # comparison tuples that we know we don't care about
+
+        # if this is part of a run of all FOVs, we don't want to present a tdqm bar
+        # for just one FOV (they will be run in parallel and it will break)
+        if not disable_tqdm:
+            print(
+                "\treading transcripts: identify confident trs and valid overlapping regions..."
+            )
+            pbar = tqdm(total=len(tr))
+        else:
+            pbar = None
+
+        for r, row in tr.iterrows():
+            if pbar is not None:
+                pbar.update(1)
+
+            # omit blanks
+            if omit_blanks and "lank" in row["gene"]:
+                continue
+
+            assigned = ast.literal_eval(row["cell_ids"])
+
+            # skip over any transcript that has no possible cell assignments
+            if len(assigned.keys()) == 0:
+                continue
+
+            if only_tagged_cells is None or any(
+                [str(cell) in assigned.keys() for cell in only_tagged_cells]
+            ):
+                # TODO: for now, only_tagged_cells will always be false
+                # In the future, plan to add support for list of suspect cells
+
+                # try to assign to a single cell
+                conf_cell = self.assign_to_cell(assigned, min_thresh)
+                self.tr_to_gene[row["index"]] = row["gene"]
+                if conf_cell is not None:
+                    # transcript has confident assignment
+                    if conf_cell in conf_trs.keys():
+                        conf_trs[conf_cell].append(row["index"])
+                    else:
+                        conf_trs[conf_cell] = [row["index"]]
+                else:
+                    # dealing with a non-confident transcript
+                    unconf_tup = tuple(sorted([k for k in assigned.keys()]))
+                    if unconf_tup in skip_cached:
+                        continue
+
+                    # throw out this comparison if we don't have a type for
+                    # all cells present and we are not explicitly treating them
+                    # as "other"
+                    if not use_other_cells and any(
+                        [cell not in self.cell_to_type.keys() for cell in unconf_tup]
+                    ):
+                        skip_cached.append(unconf_tup)
+                        self.logger.info(
+                            f"Throwing out tuple {unconf_tup}, contains untyped cell."
+                        )
+                        continue
+
+                    # we only care about this unconf_tup comparison
+                    # if there are at least 2 different celltypes present
+                    # AND it is not a single cell's unconfident transcripts
+                    if len(set([self.cell_to_type[cell] for cell in unconf_tup if cell in self.cell_to_type.keys()])) < 2:
+                        if len(unconf_tup) == 1 and use_other_cells:
+                            self.logger.info(
+                                f"Tuple {unconf_tup} would be thrown out, but we are evaluating it independently."
+                            )
+                        else:
+                            skip_cached.append(unconf_tup)
+                            self.logger.info(
+                                f"Throwing out tuple {unconf_tup}, contains single cell type."
+                            )
+                            continue
+
+                    if unconf_tup not in unconf_trs.keys():
+                        unconf_trs[unconf_tup] = {}
+
+                    # adding values of each possible assignment to proper dict entry
+                    for cell, prob in assigned.items():
+                        tr_val = (row["index"], prob)
+                        if cell in unconf_trs[unconf_tup].keys():
+                            unconf_trs[unconf_tup][cell].append(tr_val)
+                        else:
+                            unconf_trs[unconf_tup][cell] = [tr_val]
+
+        if pbar is not None:
+            pbar.close()
+
+        # convert unconf_trs values to np arrays to save time later
+        for unconf_tup in unconf_trs.keys():
+            for cell in unconf_trs[unconf_tup].keys():
+                unconf_trs[unconf_tup][cell] = np.array(unconf_trs[unconf_tup][cell])
+
+        if len(unconf_trs.keys()) == 0:
+            self.logger.info(f"No unconfident transcripts in fov_{f:0>4}, skipping.")
+            return
+
+        max_len = max([len(k) for k in unconf_trs.keys()])
+
+        assigned_trs = {}
+        # key: cell
+        # value: list of transcript IDs
+
+        seg_is_default = {}
+        # key: unconf_tup
+        # value: True if using original masks, False if using novel mask
+
+        if not disable_tqdm:
+            print("\tassigning unconfident transcripts...")
+            pbar = tqdm(total=len(unconf_trs))
+        else:
+            pbar = None
+
+        # start with one way comparisons, then work our way up
+        for cur_len in range(1, max_len + 1):
+            for unconf_tup, tr_by_cell in unconf_trs.items():
+                if len(unconf_tup) != cur_len:
+                    continue
+
+                if pbar is not None:
+                    pbar.update(1)
+
+                elg_cells = list(unconf_tup)
+
+                # coming up with "default" score for comparison
+                best_score = -1
+                best_assignment = self.trs_at_default(tr_by_cell)
+                if use_conf_trs:
+                    best_assignment = self.dict_merge(
+                        best_assignment, conf_trs, elg_cells
+                    )
+                    best_assignment = self.dict_merge(
+                        best_assignment, assigned_trs, elg_cells
+                    )
+
+                default_score = self.score_tr_assignment(best_assignment)
+
+                # handle this more simply if we only have one transcript in this region
+                total_trs = sum([len(trs) for trs in tr_by_cell.values()]) / 2
+                if total_trs == 1:
+                    # manually run this one trascript though all eligible cells
+                    for cell in tr_by_cell.keys():
+                        assignment = {cell: [tr_by_cell[cell][0, 0]]}
+                        score = self.score_tr_assignment(assignment)
+                        if (
+                            score > best_score
+                            and score > default_score * default_thresh
+                        ):
+                            best_score = score
+                            if "other" not in assignment.keys():
+                                best_assignment = assignment
+                            else:
+                                best_assignment = {
+                                    k: v for k, v in assignment.items() if k != "other"
+                                }
+                else:
+                    # coming up with range of thresholds to check
+                    maxgrad = max(
+                        [max(tr_by_cell[cell][:, 1]) for cell in tr_by_cell.keys()]
+                    )
+                    mingrad = min(
+                        [min(tr_by_cell[cell][:, 1]) for cell in tr_by_cell.keys()]
+                    )
+                    step = max_len - cur_len + 2
+
+                    if total_trs < step:
+                        self.logger.info(
+                            f"Comparison region {unconf_tup} has fewer than {step} transcripts, changing step to {total_trs}"
+                        )
+                        step = total_trs - 1
+
+                    if maxgrad == mingrad:
+                        # possible to have multiple transcripts with the same value
+                        # just manually fudge this to assign both or neither
+                        # (arange does not line having min and max be the same value)
+                        maxgrad += 0.01
+                        mingrad -= 0.01
+                        step = 1
+
+                    # in the case where we are looking at ambiguous transcropts
+                    # with one possible cell assignment, we add a nonexistent "other"
+                    # cell to compare against
+                    if use_other_cells and cur_len == 1:
+                        tr_by_cell.update(
+                            {"other": tr_by_cell[unconf_tup[0]]}
+                        )
+                        elg_cells.append("other")
+
+                    for thresh in np.arange(
+                        mingrad, maxgrad, (maxgrad - mingrad) / step
+                    ):
+                        for prim_ind in range(cur_len):
+                            assignment = self.trs_at_thresh(
+                                thresh, elg_cells, tr_by_cell, tr, prim_ind
+                            )
+
+                            if use_conf_trs:
+                                assignment = self.dict_merge(
+                                    assignment, conf_trs, elg_cells
+                                )
+                                assignment = self.dict_merge(
+                                    assignment, assigned_trs, elg_cells
+                                )
+
+                            score = self.score_tr_assignment(assignment)
+                            if (
+                                score > best_score
+                                and score > default_score * default_thresh
+                            ):
+                                best_score = score
+                                # strip the "other" back out if this was a
+                                # one-way comparison
+                                if "other" not in assignment.keys():
+                                    best_assignment = assignment
+                                else:
+                                    best_assignment = {
+                                        k: v
+                                        for k, v in assignment.items()
+                                        if k != "other"
+                                    }
+
+                seg_is_default[unconf_tup] = best_score == -1
+
+                for cell, trs in best_assignment.items():
+                    if len(trs) > 0 and cell != "other":
+                        if cell in assigned_trs.keys():
+                            assigned_trs[cell].extend([float(t) for t in trs])
+                        else:
+                            assigned_trs[cell] = [float(t) for t in trs]
+
+        if pbar is not None:
+            pbar.close()
+
+        self.logger.info(
+            f"[{datetime.now()}] saving pydict and updating tr for fov_{f:0>4}"
+        )
+
+        # saving dict of transcripts that we have reassigned
+        dict_loc = (
+            f"{self.complete_loc}overlap_eval_{assigned_col}_fov_{f:0>4}.pydict"
+        )
+        with open(dict_loc, "w") as fl:
+            fl.write(str(assigned_trs))
+
+        # below creates dict of {key: tr ID, value: cell ID}
+        inv_assignment = {
+            k: v
+            for d in [{tr: cell for tr in trs} for cell, trs in assigned_trs.items()]
+            for k, v in d.items()
+        }
+        # now add in confident assignments
+        inv_assignment.update(
+            {
+                k: v
+                for d in [{tr: cell for tr in trs} for cell, trs in conf_trs.items()]
+                for k, v in d.items()
+            }
+        )
+        # create new column for tr dataframe where row is transcript ID and value is cell assignment
+        new_col = tr.apply(
+            lambda b: (
+                inv_assignment[b["index"]]
+                if b["index"] in inv_assignment.keys()
+                else np.nan
+            ),
+            axis=1,
+        )
+        tr[assigned_col] = new_col
+
+        # last bit of cleanup before we save it:
+        tr = tr.loc[:, ~tr.columns.str.contains("^Unnamed")]
+        tr.to_csv(self.complete_csv_name.format(f), sep=",")
+
+        # this is too big to keep in memory if we're a part of a pool
+        # that's running everything. So, delete if we are in a pool.
+        if multiprocessing.current_process().daemon:
+            return
+        else:
+            return assigned_trs, seg_is_default
+
+    def __func_wrapper__(self, args):
+        # needed to use imap; want to use imap to have tqdm progress bar
+        # pass target function as first arg, the rest get passed through
+        return args[0](*args[1:])
+
+    def evaluate_all_overlapping_regions(
+        self,
+        sel_fovs=None,
+        min_thresh=None,
+        default_thresh=5,
+        only_tagged_cells=None,
+        use_conf_trs=False,
+        use_other_cells=False,
+        assigned_col="assignment",
+        omit_blanks=False,
+    ):
+        """
+        Runner for evaluate_overlapping_regions_single
+        Runs said method in parallel on multiple fovs.
+        """
         if sel_fovs is None:
             sel_fovs = self.get_complete_fovs()
 
-        all_reass = {}
-        results = {}
-        dupe_ass = {}
-        tr_writer = open(f"{self.complete_loc}{datetime.now()}_changed_trs.csv", "w")
-        tr_writer.write("transcript ID,cell ID\n")
+        # jank workaround because multiprocessing seems to leak ram.
+        # divide our list of fovs into sub-lists with max_fov_pool elements
+        # then run multiprocessing sequentially on each of these.
+        max_fov_pool = 100
+        fov_pool = []
+        offset = int(len(sel_fovs) % max_fov_pool != 0)
+        for i in range(len(sel_fovs) // max_fov_pool + offset):
+            end = min(len(sel_fovs), (i + 1) * max_fov_pool)
+            fov_pool.append(sel_fovs[i * max_fov_pool : end])
 
-        dict_loc = f"{self.complete_loc}{datetime.now()}_overlap_eval.pydict"
+        self.logger.info(f"Pooling fovs for parallel processing, as:\n{fov_pool}")
 
-        fov_tally = 0
-
-        for f in sel_fovs:
-            dupe_ass[f] = {}
-            tr = pd.read_csv(self.complete_csv_name.format(f))
-            tr = tr.reset_index()
-            im = skimage.io.imread(self.im_loc.format(f))
-
-            self.logger.info(
-                f"[{datetime.now()}] evaluate_overlapping_regions starting fov_{f:0>4}..."
-            )
-
-            print(f"Starting fov_{f:0>4} ({100*fov_tally/len(sel_fovs):.2f}%):")
-            print("\treading transcripts...")
-            fov_tally += 1
-
-            # first step: identify regions where transcripts have the potential to be
-            # assigned to more than one cell.
-            with tqdm(total=len(tr)) as pbar:
-                for r, row in tr.iterrows():
-                    pbar.update(1)
-
-                    # omit blanks
-                    if "lank" in row["gene"]:
-                        continue
-
-                    asst = ast.literal_eval(row["cell_ids"])
-                    # keys are cell ids, values are assigned likelihoods
-                    if len(asst.keys()) > 1:
-                        # first, filter out any cell ids that got filtered before labelling
-                        elg_cells = [k for k in asst.keys() if k in adata.obs.index]
-                        self.logger.debug(f"{asst} {elg_cells}")
-
-                        # now, select for transcripts above threshold
-                        # these are the only things eligible to be assigned to
-                        pos_keys = tuple(
-                            sorted(
-                                [
-                                    k
-                                    for k in elg_cells
-                                    # if (min_thresh is None or asst[k] > min_thresh)
-                                    # ^ this is from when we had a seperate threshold
-                                    # from the confident one. We never actually used it.
-                                ]
-                            )
-                        )
-
-                        # if it's not eligible to be assigned to anything, we don't care...
-                        if len(pos_keys) == 0:
-                            continue
-
-                        # next, see if this is a comparison that we even care about
-                        # need at least one of these cells to be a different type
-                        types = [
-                            extract_celltype(cats, adata.obs.loc[[i]])
-                            for i in elg_cells
-                        ]
-
-                        # we don't care if everything is the same type
-                        if len(set(types)) < 2:
-                            continue
-
-                        transc = (row["gene"], row["index"])
-                        tp = tuple(sorted(elg_cells))
-                        # OK NOW. we are looking to reassign transc to one of pos_keys
-                        # while we are looking at a comparison of anything in tp
-
-                        if tp not in dupe_ass[f].keys():
-                            dupe_ass[f][tp] = {}
-
-                        if pos_keys not in dupe_ass[f][tp].keys():
-                            dupe_ass[f][tp][pos_keys] = [transc]
-                        else:
-                            dupe_ass[f][tp][pos_keys].append(transc)
-
-            # pruning step: reduce entries where not all comparisons are made
-            # this is a lot more complicated with n possible comparisons...
-
-            # print(f"pre prune dupes {dupe_ass[f]}")
-
-            to_del = []
-            to_add = {}
-            print("\tpruning comparisons...")
-            with tqdm(total=len(dupe_ass[f])) as pbar:
-                for k, v in dupe_ass[f].items():
-                    pbar.update(1)
-                    # remove comparisons where there are no overlapping possible cell assignments
-                    if list(set([len(i) for i in v.keys()])) == [1]:
-                        to_del.append(k)
-                    # if this can be better crammed inside a more specific comparison, do so.
-                    if (
-                        max([len(i) for i in v.keys()]) == len(k) - 1
-                        and len([len(i) for i in v.keys() if i == len(k) - 1]) == 1
-                    ):
-                        k_sel = [i for i in v.keys() if len(i) == len(k) - 1][0]
-                        to_add[k_sel] = k
-                        to_del.append(k)
-            for k, k_big in to_add.items():
-                for sm in dupe_ass[f][k].keys():
-                    dupe_ass[f][k][sm].extend(dupe_ass[f][k_big][sm])
-            for k in to_del:
-                dupe_ass[f].pop(k, None)
-
-            self.logger.info(
-                f"[{datetime.now()}] complete set of duplicated regions for fov_{f:0>4}\n{yaml.dump(dupe_ass[f])}"
-            )
-            self.logger.debug(
-                f"[{datetime.now()}] cell combos removed for fov_{f:0>4}: {to_del}"
-            )
-
-            # find and save all confident assignments, to avoid
-            # repeated iteration for each pairing
-            print("\tidentifying confident transcripts...")
-            conf_tr = {}
-            with tqdm(total=len(tr)) as pbar:
-                for r, row in tr.iterrows():
-                    pbar.update(1)
-                    if "lank" not in row["gene"]:
-                        asst = ast.literal_eval(row["cell_ids"])
-                        target = self.assign_to_cell(asst, min_thresh)
-                        if target is not None:
-                            if target in conf_tr.keys():
-                                conf_tr[target].append(row["gene"])
-                            else:
-                                conf_tr[target] = [row["gene"]]
-
-            # this only matters within an FOV
-            all_reass_check = set()
-
-            # if we don't have any comparisons, skip ahead...
-            if len(dupe_ass[f].keys()) == 0:
-                print("\tno comparisons to be made, skipping FOV.")
-                continue
-
-            # start with 2 way comparisons, working our way up to n-way
-            max_comp = max([len(k) for k in dupe_ass[f].keys()])
-            comp_tally = 0
-
-            print("\tperforming n-way comparisons...")
-
-            with tqdm(total=len(dupe_ass[f])) as pbar:
-                for ln in range(2, max_comp + 1):
-                    # print(l)
-                    for k, gene_lis in dupe_ass[f].items():
-                        if len(k) != ln:
-                            continue
-
-                        reass_inds = {}
-
-                        # get our celltypes
-                        types = [extract_celltype(cats, adata.obs.loc[[i]]) for i in k]
-
-                        # need to go through and retrieve the confident transcripts
-                        conf_inds = []
-                        for v in range(ln):
-                            temp = []
-                            if k[v] in conf_tr.keys():
-                                for gene in conf_tr[k[v]]:
-                                    if gene in self.df_comp.columns:
-                                        t = self.df_comp[gene].copy()
-                                        t = t.loc[types]
-                                        # t.name = f"{gene}_{types[l]}"
-                                        temp.append(t)
-                                conf_inds.append(pd.concat(temp, axis=1))
-                            else:
-                                conf_inds.append([])
-
-                        amb_inds = {}
-                        for inds, genes in gene_lis.items():
-
-                            # treat genes only in one of these zones separately
-                            if len(inds) == 1:
-                                t = max([i for i in range(ln) if inds[0] == k[i]])
-                                for gene, index in genes:
-                                    temp = self.df_comp[gene].copy()
-                                    temp = temp.loc[types]
-                                    if len(conf_inds[t]) > 0:
-                                        conf_inds[t] = pd.concat(
-                                            [conf_inds[t], temp], axis=1
-                                        )
-                                    else:
-                                        conf_inds[t] = temp
-                            else:
-                                # this is the overlap zone
-                                amb_inds[inds] = []
-                                reass_inds[inds] = []
-                                # print(f"{inds} all genes: {genes}")
-                                for gene, index in genes:
-                                    if (
-                                        gene in self.df_comp.columns
-                                    ):  # possible for genes to get dropped in filtering
-                                        # if this has been reassigned elsewhere, go with that
-                                        if index in all_reass.keys():
-                                            c = all_reass[index]
-                                            cell_ind = [
-                                                ks for ks in range(len(k)) if k[ks] == c
-                                            ]
-                                            if len(cell_ind) != 1:
-                                                self.logger.info(
-                                                    f"Warning! Gene {index} has been assigned to {all_reass[index]}, which is not one of the eligible cells in this comparison!"
-                                                )
-                                                continue
-                                            temp = self.df_comp[gene].copy()
-                                            temp = temp.loc[types]
-                                            if len(conf_inds[cell_ind[0]]) > 0:
-                                                conf_inds[cell_ind[0]] = pd.concat(
-                                                    [conf_inds[cell_ind[0]], temp],
-                                                    axis=1,
-                                                )
-                                            else:
-                                                conf_inds[cell_ind[0]] = temp
-                                        else:
-                                            temp = self.df_comp[gene].copy()
-                                            temp = temp.loc[types]
-                                            amb_inds[inds].append(temp)
-                                            reass_inds[inds].append(index)
-
-                        ov_check = []
-                        for ind, v in reass_inds.items():
-                            ov_check.extend(v)
-                        overlap = set.intersection(all_reass_check, set(ov_check))
-                        if len(overlap) > 0:
-                            self.logger.info(
-                                f"Warning! Transcripts {overlap} have already been reassigned!"
-                            )
-
-                        top_val = 0
-                        winning_combo = []
-
-                        for combo in itertools.product(
-                            *[(*cellid, "Original") for cellid in amb_inds.keys()]
-                        ):
-                            sel_vals = {}
-                            for v in range(len(conf_inds)):
-                                if (
-                                    len(conf_inds[v]) > 0
-                                ):  # not interested if there aren't any
-                                    if hasattr(
-                                        conf_inds[v].values[v], "__len__"
-                                    ):  # it's possible to just have one cell
-                                        sel_vals[k[v]] = list(conf_inds[v].values[v])
-                                    else:
-                                        sel_vals[k[v]] = [conf_inds[v].values[v]]
-
-                            key_ref = list(amb_inds.keys())
-                            for v_tup in range(len(combo)):
-                                cell_ind = combo[v_tup]
-                                sel_keyset = key_ref[v_tup]
-                                if cell_ind != "Original":
-                                    ind = list(sel_keyset).index(cell_ind)
-                                    if len(amb_inds[sel_keyset]) == 0:
-                                        self.logger.info(
-                                            f"Combo {sel_keyset} has no ambiguous transcripts."
-                                        )
-                                        continue
-
-                                    t_df = pd.concat(amb_inds[sel_keyset], axis=1)
-
-                                    n_val = t_df.values[ind]
-                                    if cell_ind in sel_vals.keys():
-                                        if hasattr(n_val, "__len__"):
-                                            sel_vals[cell_ind].extend(n_val)
-                                        else:
-                                            sel_vals[cell_ind].append(n_val)
-                                    else:
-                                        # THIS was what fixed the nested list problem
-                                        # TODO: figure out why this matters!!
-                                        if hasattr(n_val, "__len__"):
-                                            sel_vals[cell_ind] = n_val
-                                        else:
-                                            sel_vals[cell_ind] = [n_val]
-                                else:
-                                    for tr_tup in gene_lis[sel_keyset]:
-                                        tr_id = tr_tup[1]
-                                        row = tr.loc[tr["index"] == int(tr_id)]
-                                        if len(np.shape(im)) == 2:
-                                            one_cell_ind = (
-                                                im[row["y"] - 1, row["x"] - 1][0] - 1
-                                            )
-                                        else:
-                                            one_cell_ind = (
-                                                im[
-                                                    row["global_z"],
-                                                    row["y"] - 1,
-                                                    row["x"] - 1,
-                                                ][0]
-                                                - 1
-                                            )
-                                        if str(one_cell_ind) in list(sel_keyset):
-                                            ind = list(sel_keyset).index(
-                                                str(one_cell_ind)
-                                            )
-                                        else:
-                                            if one_cell_ind > 0:
-                                                self.logger.info(
-                                                    f"Warning! Original cell assignment {one_cell_ind} for transcript {tr_id} not in possible comparison list {sel_keyset}!"
-                                                )
-                                            continue
-
-                                        if tr_tup[0] in self.df_comp.columns:
-                                            t_df = self.df_comp[tr_tup[0]].copy()
-                                            t_df = t_df.loc[types]
-
-                                            n_val = t_df.values[ind]
-                                            if cell_ind in sel_vals.keys():
-                                                if hasattr(n_val, "__len__"):
-                                                    sel_vals[cell_ind].extend(n_val)
-                                                else:
-                                                    sel_vals[cell_ind].append(n_val)
-                                            else:
-                                                sel_vals[cell_ind] = [n_val]
-
-                            everything = [
-                                v
-                                for row in [val for k, val in sel_vals.items()]
-                                for v in row
-                            ]
-
-                            # Below should never be run, this bug has been isolated.
-                            if any([hasattr(e, "__len__") for e in everything]):
-                                print("Erroneous nested list!")
-                                for k, v in sel_vals.items():
-                                    if any([hasattr(m, "__len__") for m in v]):
-                                        print(f"{k}:{v}")
-
-                            # again, this flatten *shouldn't* matter, but leaving it in as a safety anyways.'
-                            everything = flatten(everything)
-                            avg = np.average(everything)
-
-                            if avg > top_val:
-                                winning_combo = combo
-                                top_val = avg
-
-                        comp_tally += 1
+        with tqdm(total=len(sel_fovs)) as pbar:
+            for subset_fovs in fov_pool:
+                self.logger.info(f"[{datetime.now()}] starting sub-pool: {subset_fovs}")
+                with closing(Pool(processes=self.pool_size)) as pool:
+                    results = pool.imap_unordered(
+                        self.__func_wrapper__,
+                        zip(
+                            repeat(self.evaluate_overlapping_regions_single_fov),
+                            subset_fovs,
+                            repeat(min_thresh),
+                            repeat(default_thresh),
+                            repeat(only_tagged_cells),
+                            repeat(use_conf_trs),
+                            repeat(use_other_cells),
+                            repeat(assigned_col),
+                            repeat(omit_blanks),
+                            repeat(True),
+                        ),
+                    )
+                    for result in results:
                         pbar.update(1)
-                        # if comp_tally % 20 == 0:
-                        #     print(f"\t{comp_tally}/{len(dupe_ass[f])}")
-                        # print(amb_inds.keys())
-
-                        key_ref = list(reass_inds.keys())
-                        for v in range(len(winning_combo)):
-                            for ge in reass_inds[key_ref[v]]:
-                                all_reass[ge] = winning_combo[v]
-                                if winning_combo[v] != "Original":
-                                    tr_writer.write(f"{ge},{all_reass[ge]}\n")
-                            if winning_combo[v] != "Original":
-                                results[key_ref[v]] = extract_celltype(
-                                    cats, adata.obs.loc[[winning_combo[v]]]
-                                )
-                            else:
-                                results[key_ref[v]] = "Original"
-
-                        # if a_vals.mean() > b_vals.mean():
-                        #    results[k] = gene_inds.index[0]
-                        #    all_reass.update({i:k[0] for i in reass_inds}) # gene ind : cell ind
-
-                        for k, v in reass_inds.items():
-                            all_reass_check.update(set(v))
-
-                        # we'll just manually re-save this after each FOV finishes
-                        # in the event of error we'll still have something'
-                        with open(dict_loc, "w") as fl:
-                            fl.write(str(results))
-
-        tr_writer.close()
-        return results
-
-    def update_reassigned_segs(
-        self, changed_tr, ann_adata, min_thresh=None, ncol_name="reassigned"
-    ):
-        """
-        Given a dataframe of changed transcripts, create an updated anndata object
-        with the new gene by cell assignments. Also adds a column by the name of
-        ncol_name to each transcript table.
-        """
-
-        cxg_dict = {}
-        fovs = self.get_complete_fovs()
-
-        # first, we convert changed_tr from a dataframe to a dict,
-        # which saves us a TON of time on lookup later.
-
-        tr_dict = {}
-        for i, row in changed_tr.iterrows():
-            tr_dict[row["transcript ID"]] = row["cell ID"]
-
-        for f in fovs:
-            tr = pd.read_csv(self.complete_csv_name.format(f))
-            self.logger.info(f"[{datetime.now()}] starting fov_{f:0>4}...")
-
-            ncol = []
-            for i, row in tr.iterrows():
-                assigned = ast.literal_eval(row["cell_ids"])
-                k = self.assign_to_cell(assigned, min_thresh)
-
-                # if this is a transcript we reassigned, we need to update that
-                if row["index"] in tr_dict.keys():
-                    k = tr_dict[row["index"]]
-
-                if k is not None:
-                    k = int(k)  # reading in from ast will be a string
-                    ncol.append(k)
-                    if k in cxg_dict.keys():
-                        if row["gene"] in cxg_dict[k].keys():
-                            cxg_dict[k][row["gene"]] += 1
-                        else:
-                            cxg_dict[k][row["gene"]] = 1
-                    else:
-                        cxg_dict[k] = {row["gene"]: 1}
-                else:
-                    ncol.append(np.nan)
-            tr[ncol_name] = ncol
-
-            # save modified transcript table
-            tr.to_csv(self.complete_csv_name.format(f), sep=",")
-            del tr
-
-        cxg_df = pd.DataFrame.from_dict(cxg_dict, orient="index")
-        new_adata = ad.AnnData(cxg_df)
-
-        self.logger.debug(f"[{datetime.now()}] Converted new matrix to anndata.")
-
-        # now, cleaning it up to match the annotated anndata
-        col_oi = [col for col in ann_adata.obs.columns if "count" not in col]
-        sel_cells = []
-        for cell in new_adata.obs.index.to_list():
-            if cell in ann_adata.obs.index:
-                sel_cells.append(cell)
-
-        new_adata = new_adata[[cell in sel_cells for cell in new_adata.obs.index]]
-        for col in col_oi:
-            new_adata.obs[col] = pd.DataFrame(np.zeros((len(new_adata), 1)))
-            new_adata.obs.loc[sel_cells, col] = ann_adata.obs.loc[sel_cells, col]
-
-        dat = datetime.today().strftime("%Y%m%d")
-        filename = f"{self.complete_loc}cxg_adata_resegmented_{dat}.h5ad"
-        new_adata.write_h5ad(filename)
-        print(f"Saved {filename}")

@@ -2,9 +2,12 @@
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/SoftSeg"]
+
 [project]
 name = "SoftSeg"
-version = "0.1.6"
+version = "0.2.0"
 authors = [
   { name="Cecilia Cisar", email="ccisar@ucsc.edu" },
 ]
