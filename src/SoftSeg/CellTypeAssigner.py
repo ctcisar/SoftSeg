@@ -5,7 +5,6 @@ import anndata as ad
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import requests
 import scanpy as sc
 from tqdm import tqdm
@@ -39,7 +38,7 @@ class CellTypeAssigner:
         if adata is not None:
             self.adata = adata
         elif adata_loc is not None:
-            self.adata = ad.read(adata_loc + "cxg_adata.h5ad")
+            self.adata = ad.read(adata_loc)
             self.adata_loc = adata_loc
         else:
             Exception("Either adata object or file location must be provided.")
@@ -50,7 +49,11 @@ class CellTypeAssigner:
             print("Requires `adata_loc` to be set.")
         else:
             dat = datetime.today().strftime("%Y%m%d")
-            filename = f"{self.adata_loc}/cxg_adata_highlevel_wpca_{dat}.h5ad"
+            if ".h5ad" in self.adata_loc:
+                newloc = "/".join(self.adata_loc.split("/")[:-1])
+                filename = f"{newloc}/cxg_adata_celltypes_{dat}.h5ad"
+            else:
+                filename = f"{self.adata_loc}/cxg_adata_highlevel_wpca_{dat}.h5ad"
             self.adata.write_h5ad(filename)
             print(f"Saved {filename}")
             return filename

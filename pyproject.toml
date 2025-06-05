@@ -7,7 +7,7 @@ packages = ["src/SoftSeg"]
 
 [project]
 name = "SoftSeg"
-version = "0.2.0"
+version = "0.2.1"
 authors = [
   { name="Cecilia Cisar", email="ccisar@ucsc.edu" },
 ]
