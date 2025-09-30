@@ -57,7 +57,7 @@ def plot_kl_divergence(
             plt.hlines(hlines[time], 0, len(cell_types), hlines_color[time])
 
     plt.xlabel("Cell Type")
-    plt.tick_params("x", length=10, labelsize="small")
+    plt.tick_params("x", length=10, labelsize="small", labelrotation=90)
     plt.ylabel("KL-divergence")
     if title is not None:
         plt.title(title)

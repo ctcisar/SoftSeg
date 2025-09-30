@@ -218,7 +218,13 @@ class SoftAssigner:
                             return results
         return results
 
-    def plot_completed_cell(self, fov, cells, tr_hi=None):
+    def plot_completed_cell(self, fov, cells, dist_between_slices=None, tr_hi=None):
+        """
+        tr_hi formatting:
+        OPTIONAL dict key: color to use, values are dicts below:
+        dict key: column to compare to transcript dataframe
+           value: single value to match against OR list of values
+        """
         im = skimage.io.imread(self.im_loc.format(fov))
         tr = pd.read_csv(self.complete_csv_name.format(fov))
 
@@ -261,8 +267,10 @@ class SoftAssigner:
             clen = np.shape(im8)[0]
 
             c_valid = []
+            c_neighbor = []
             cnt = []
             for c in range(clen):
+                c_neighbor.append(False)
                 if len(np.unique(im8[c][z, :, :])) < 2:
                     print(f"Cell {cells[c]} not present on slice {z}")
                     cnt.append(None)
@@ -275,8 +283,37 @@ class SoftAssigner:
                     )
                     c_valid.append(True)
 
-            if not any(c_valid):
+            if dist_between_slices is None and not any(c_valid):
                 print("No valid cells in this slice.")
+                continue
+
+            # go through and find applicable neighbors, if we're dealing with that
+            if dist_between_slices is not None:
+                for i in range(len(cnt)):
+                    if not c_valid[i]:
+                        if z > 0:
+                            # check z-1
+                            if len(np.unique(im8[c][z - 1, :, :])) == 2:
+                                c_neighbor[i] = True
+                                c_valid[i] = True
+                                cnt[i] = cv2.findContours(
+                                    im8[c][z - 1, :, :],
+                                    cv2.RETR_LIST,
+                                    cv2.CHAIN_APPROX_SIMPLE,
+                                )[0]
+                        if z < np.shape(im8[c])[0] - 1:
+                            # check z+1
+                            if len(np.unique(im8[c][z + 1, :, :])) == 2:
+                                c_neighbor[i] = True
+                                c_valid[i] = True
+                                cnt[i] = cv2.findContours(
+                                    im8[c][z + 1, :, :],
+                                    cv2.RETR_LIST,
+                                    cv2.CHAIN_APPROX_SIMPLE,
+                                )[0]
+
+            if not any(c_valid) and not any(c_neighbor):
+                print("No valid cells in this slice, including neighbor slices.")
                 continue
 
             fig = plt.figure()
@@ -291,9 +328,20 @@ class SoftAssigner:
                 for j in range(xlen):
                     for c in range(clen):
                         if c_valid[c]:
-                            raw_dist[i, j, c] = cv2.pointPolygonTest(
+                            dist = cv2.pointPolygonTest(
                                 cnt[c][0], (j, i), True
                             )
+                            if not c_neighbor[c]:
+                                raw_dist[i, j, c] = dist
+                            else:
+                                if dist < 0:
+                                    raw_dist[i, j, c] = -1 * np.sqrt(
+                                        dist ** 2 + dist_between_slices ** 2
+                                    )
+                                else:
+                                    raw_dist[i, j, c] = max(-1 * np.sqrt(
+                                        dist ** 2 + dist_between_slices ** 2
+                                    ), dist_between_slices * -1)
 
             drawing = np.zeros((ylen, xlen, 3))
             for i in range(ylen):
@@ -312,8 +360,11 @@ class SoftAssigner:
                         ),
                     )
 
-            for cn in cnt:
-                draw_im = cv2.drawContours(drawing, cn, 0, (1, 1, 1), 1)
+            for i in range(len(cnt)):
+                col = (1, 1, 1)
+                if c_neighbor[i]:
+                    col = (0.5, 0.5, 0.5)
+                draw_im = cv2.drawContours(drawing, cnt[i], 0, col, 1)
 
             ax.imshow(draw_im)
 
@@ -323,12 +374,22 @@ class SoftAssigner:
                     facecolor = (row["c1"], row["c2"], row["c0"])
                     if tr_hi is not None:
                         for k, vs in tr_hi.items():
-                            if isinstance(vs, list):
-                                if row[k] in vs:
-                                    facecolor = (1, 1, 1)
+                            if isinstance(vs, dict):
+                                # then k is the color to use
+                                for ind, vals in vs.items():
+                                    if isinstance(vals, list):
+                                        if row[ind] in vals:
+                                            facecolor = k
+                                    else:
+                                        if row[ind] == vals:
+                                            facecolor = k
                             else:
-                                if row[k] == vs:
-                                    facecolor = (1, 1, 1)
+                                if isinstance(vs, list):
+                                    if row[k] in vs:
+                                        facecolor = (1, 1, 1)
+                                else:
+                                    if row[k] == vs:
+                                        facecolor = (1, 1, 1)
                     circle = Circle(
                         (int(row["x"]) - x_0, int(row["y"]) - y_0),
                         radius=1,
@@ -345,7 +406,9 @@ class SoftAssigner:
         del im
         del tr
 
-    def blur_fov(self, f, min_size, max_dist, dist_between_slices=None, disable_tqdm=False):
+    def blur_fov(
+        self, f, min_size, max_dist, dist_between_slices=None, disable_tqdm=False
+    ):
         """Run the first step of soft-segmentation, where masks are blurred and
         multiple float values assigned to each transcript, corresponding to which
         cells they may be members of and their relative likelihoods.
@@ -417,13 +480,12 @@ class SoftAssigner:
                     for j in range(len(tr)):
                         dist = cv2.pointPolygonTest(
                             cnt[0],
-                            (x[j]-1, y[j]-1),
+                            (x[j] - 1, y[j] - 1),
                             True,
                         )
                         if dist > -1 * max_dist:
                             cell_ids[j] = dict(
-                                cell_ids[j],
-                                **{str(m - 1): self.decay_func(dist)}
+                                cell_ids[j], **{str(m - 1): self.decay_func(dist)}
                             )
                 else:  # three dimensional (presumably)
                     # slices in image may not line up with data...
@@ -451,13 +513,13 @@ class SoftAssigner:
                         for z in list(cntz_best_neighbor.keys()):
                             # realistically we should not have a case where there are two neighboring slices
                             # that both have contours surrounding a slice with no contours. So just do basic check.
-                            if z-1 in cntz.keys():
-                                cntz_best_neighbor[z] = cntz[z-1]
+                            if z - 1 in cntz.keys():
+                                cntz_best_neighbor[z] = cntz[z - 1]
                                 self.logger.info(
                                     f"Assigning cell ID {m-1} zslice {z} nearest neighbor as {z-1}."
                                 )
-                            elif z+1 in cntz.keys():
-                                cntz_best_neighbor[z] = cntz[z+1]
+                            elif z + 1 in cntz.keys():
+                                cntz_best_neighbor[z] = cntz[z + 1]
                                 self.logger.info(
                                     f"Assigning cell ID {m-1} zslice {z} nearest neighbor as {z+1}."
                                 )
@@ -473,22 +535,27 @@ class SoftAssigner:
                             if z_global[j] in cntz.keys():
                                 dist = cv2.pointPolygonTest(
                                     cntz[z_global[j]],
-                                    (x[j]-1, y[j]-1),
+                                    (x[j] - 1, y[j] - 1),
                                     True,
                                 )
                             elif z_global[j] in cntz_best_neighbor.keys():
-                                dist = np.sqrt(
-                                    cv2.pointPolygonTest(
+                                dist = cv2.pointPolygonTest(
                                         cntz_best_neighbor[z_global[j]],
-                                        (x[j]-1, y[j]-1),
+                                        (x[j] - 1, y[j] - 1),
                                         True,
-                                    )**2 + dist_between_slices**2
                                 )
+                                if dist < 0:
+                                    dist = -1 * np.sqrt(
+                                        dist ** 2 + dist_between_slices ** 2
+                                    )
+                                else:
+                                    dist = max(-1 * np.sqrt(
+                                        dist ** 2 + dist_between_slices ** 2
+                                    ), dist_between_slices * -1)
 
                             if dist is not None and dist > -1 * max_dist:
                                 cell_ids[j] = dict(
-                                    cell_ids[j],
-                                    **{str(m - 1): self.decay_func(dist)}
+                                    cell_ids[j], **{str(m - 1): self.decay_func(dist)}
                                 )
                 if not disable_tqdm:
                     pbar.update(1)
@@ -519,13 +586,20 @@ class SoftAssigner:
             print(f"\ttime taken:{(time.time() - t1)/60} minutes.")
             """
 
-            return tr
+            # Going to assume that disabled tqdm is a part of a batch run
+            if not disable_tqdm:
+                return tr
+            else:
+                del tr
+                return None
 
         else:
             print(f"Skipping fov_{f:0>4}, no transcripts found.")
             return None
 
-    def blur_all_fovs(self, min_size, max_dist, dist_between_slices=None, sel_fovs=None):
+    def blur_all_fovs(
+        self, min_size, max_dist, dist_between_slices=None, sel_fovs=None
+    ):
         """Run the first step of soft-segmentation, where masks are blurred and
         multiple float values assigned to each transcript, corresponding to which
         cells they may be members of and their relative likelihoods.
@@ -544,7 +618,7 @@ class SoftAssigner:
         with tqdm(total=len(sel_fovs)) as pbar:
             with closing(Pool(self.pool_size)) as pool:
                 results = pool.imap_unordered(
-                    self.__func__wrapper__,
+                    self.__func_wrapper__,
                     zip(
                         repeat(self.blur_fov),
                         sel_fovs,
@@ -755,7 +829,12 @@ class SoftAssigner:
         }
 
     def convert_to_adata(
-        self, min_thresh=None, assigned_col=None, fov_locs=None, prev_adata=None, sel_fovs=None,
+        self,
+        min_thresh=None,
+        assigned_col=None,
+        fov_locs=None,
+        prev_adata=None,
+        sel_fovs=None,
     ):
         """
         Converts all completed analyses to adata format.
@@ -789,12 +868,16 @@ class SoftAssigner:
 
             if assigned_col is not None:
                 if assigned_col not in tr.columns:
-                    self.logger.info(f"{assigned_col} not in df for fov_{f:0>4}, skipping.")
+                    self.logger.info(
+                        f"{assigned_col} not in df for fov_{f:0>4}, skipping."
+                    )
                     continue
                 tr = tr[~pd.isnull(tr[assigned_col])]
                 tallies = Counter(list(zip(tr["gene"], tr[assigned_col])))
             else:
-                cell_col = tr.cell_ids.apply(lambda x: self.assign_to_cell(ast.literal_eval(x), min_thresh))
+                cell_col = tr.cell_ids.apply(
+                    lambda x: self.assign_to_cell(ast.literal_eval(x), min_thresh)
+                )
                 inds = cell_col.apply(lambda x: x is not None)
                 tallies = Counter(list(zip(tr["gene"][inds], cell_col[inds])))
 
@@ -979,7 +1062,9 @@ class SoftAssigner:
                 gene_tallies = Counter(genes)
                 for gene in self.score_mat.keys():
                     if gene in gene_tallies:
-                        score += (self.score_mat[gene][cell_type] - gene_tallies[gene]) ** 2
+                        score += (
+                            self.score_mat[gene][cell_type] - gene_tallies[gene]
+                        ) ** 2
                     else:
                         score += self.score_mat[gene][cell_type] ** 2
 
@@ -1040,7 +1125,7 @@ class SoftAssigner:
             # find transcript with lowest assignment score for prev cell
             min_tr = todo_trs[i_cell][np.argmin(todo_trs[i_cell][:, 1]), 0]
             min_assigned = ast.literal_eval(
-                all_trs[all_trs["index"] == min_tr]["cell_ids"].values[0]
+                all_trs[all_trs.index == min_tr]["cell_ids"].values[0]
             )
 
             # get the value for the next thresh
@@ -1146,7 +1231,9 @@ class SoftAssigner:
         """
         tr = pd.read_csv(self.complete_csv_name.format(f), index_col=0)
         if assigned_col in tr.columns:
-            self.logger.info(f"[{datetime.now()}] skipping fov_{f:0>4}, {assigned_col} already present")
+            self.logger.info(
+                f"[{datetime.now()}] skipping fov_{f:0>4}, {assigned_col} already present"
+            )
             return
 
         self.logger.info(
@@ -1177,7 +1264,7 @@ class SoftAssigner:
         else:
             pbar = None
 
-        for r, row in tr.iterrows():
+        for index, row in tr.iterrows():
             if pbar is not None:
                 pbar.update(1)
 
@@ -1199,13 +1286,13 @@ class SoftAssigner:
 
                 # try to assign to a single cell
                 conf_cell = self.assign_to_cell(assigned, min_thresh)
-                self.tr_to_gene[row["index"]] = row["gene"]
+                self.tr_to_gene[index] = row["gene"]
                 if conf_cell is not None:
                     # transcript has confident assignment
                     if conf_cell in conf_trs.keys():
-                        conf_trs[conf_cell].append(row["index"])
+                        conf_trs[conf_cell].append(index)
                     else:
-                        conf_trs[conf_cell] = [row["index"]]
+                        conf_trs[conf_cell] = [index]
                 else:
                     # dealing with a non-confident transcript
                     unconf_tup = tuple(sorted([k for k in assigned.keys()]))
@@ -1227,21 +1314,34 @@ class SoftAssigner:
                     # we only care about this unconf_tup comparison
                     # if there are at least 2 different celltypes present
                     # AND it is not a single cell's unconfident transcripts
-                    if len(set([self.cell_to_type[cell] for cell in unconf_tup if cell in self.cell_to_type.keys()])) < 2:
+                    if (
+                        len(
+                            set(
+                                [
+                                    self.cell_to_type[cell]
+                                    for cell in unconf_tup
+                                    if cell in self.cell_to_type.keys()
+                                ]
+                            )
+                        )
+                        < 2
+                    ):
                         if len(unconf_tup) == 1 and use_other_cells:
                             self.logger.info(
                                 f"Tuple {unconf_tup} would be thrown out, but we are evaluating it independently."
                             )
-                        elif len(unconf_tup) == 1 and auto_assign_single_target:  # implicit: not using "other" comparison
+                        elif (
+                            len(unconf_tup) == 1 and auto_assign_single_target
+                        ):  # implicit: not using "other" comparison
                             # treat this as an assigned transcript
                             # while not confident, there is no dispute about
                             # where this transcript belongs
                             if unconf_tup[0] in assigned_trs.keys():
-                                assigned_trs[unconf_tup[0]].append(row["index"])
+                                assigned_trs[unconf_tup[0]].append(index)
                             else:
-                                assigned_trs[unconf_tup[0]] = [row["index"]]
+                                assigned_trs[unconf_tup[0]] = [index]
                             self.logger.info(
-                                f"Assigning transcript {row['index']} to unconfident but unambiguous cell assignment {unconf_tup}."
+                                f"Assigning transcript {index} to unconfident but unambiguous cell assignment {unconf_tup}."
                             )
                             continue
                         else:
@@ -1256,7 +1356,7 @@ class SoftAssigner:
 
                     # adding values of each possible assignment to proper dict entry
                     for cell, prob in assigned.items():
-                        tr_val = (row["index"], prob)
+                        tr_val = (index, prob)
                         if cell in unconf_trs[unconf_tup].keys():
                             unconf_trs[unconf_tup][cell].append(tr_val)
                         else:
@@ -1356,9 +1456,7 @@ class SoftAssigner:
                     # with one possible cell assignment, we add a nonexistent "other"
                     # cell to compare against
                     if use_other_cells and cur_len == 1:
-                        tr_by_cell.update(
-                            {"other": tr_by_cell[unconf_tup[0]]}
-                        )
+                        tr_by_cell.update({"other": tr_by_cell[unconf_tup[0]]})
                         elg_cells.append("other")
 
                     for thresh in np.arange(
@@ -1406,7 +1504,9 @@ class SoftAssigner:
                         else:
                             # if we are using the conf assignments, we need to remove them from the assignment pool.
                             actual_trs = []
-                            already_used = self.dict_merge(conf_trs, assigned_trs, [cell])
+                            already_used = self.dict_merge(
+                                conf_trs, assigned_trs, [cell]
+                            )
                             if cell not in already_used.keys():
                                 continue
                             already_used = already_used[cell]
@@ -1414,7 +1514,9 @@ class SoftAssigner:
                                 if t not in already_used:
                                     actual_trs.append(t)
                             if cell in assigned_trs.keys():
-                                assigned_trs[cell].extend([float(t) for t in actual_trs])
+                                assigned_trs[cell].extend(
+                                    [float(t) for t in actual_trs]
+                                )
                             else:
                                 assigned_trs[cell] = [float(t) for t in actual_trs]
 
@@ -1426,9 +1528,7 @@ class SoftAssigner:
         )
 
         # saving dict of transcripts that we have reassigned
-        dict_loc = (
-            f"{self.complete_loc}overlap_eval_{assigned_col}_fov_{f:0>4}.pydict"
-        )
+        dict_loc = f"{self.complete_loc}overlap_eval_{assigned_col}_fov_{f:0>4}.pydict"
         with open(dict_loc, "w") as fl:
             fl.write(str(assigned_trs))
 
@@ -1449,8 +1549,8 @@ class SoftAssigner:
         # create new column for tr dataframe where row is transcript ID and value is cell assignment
         new_col = tr.apply(
             lambda b: (
-                inv_assignment[b["index"]]
-                if b["index"] in inv_assignment.keys()
+                inv_assignment[b.name]
+                if b.name in inv_assignment.keys()
                 else np.nan
             ),
             axis=1,
