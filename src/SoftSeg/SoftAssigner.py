@@ -1303,7 +1303,7 @@ class SoftAssigner:
                     # all cells present and we are not explicitly treating them
                     # as "other"
                     if not use_other_cells and any(
-                        [cell not in self.cell_to_type.keys() for cell in unconf_tup]
+                        [(cell not in self.cell_to_type.keys() or self.cell_to_type[cell] == "Unassigned") for cell in unconf_tup]
                     ):
                         skip_cached.append(unconf_tup)
                         self.logger.info(
@@ -1447,7 +1447,7 @@ class SoftAssigner:
                     if maxgrad == mingrad:
                         # possible to have multiple transcripts with the same value
                         # just manually fudge this to assign both or neither
-                        # (arange does not line having min and max be the same value)
+                        # (arange does not like having min and max be the same value)
                         maxgrad += 0.01
                         mingrad -= 0.01
                         step = 1
