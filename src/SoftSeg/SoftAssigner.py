@@ -328,20 +328,19 @@ class SoftAssigner:
                 for j in range(xlen):
                     for c in range(clen):
                         if c_valid[c]:
-                            dist = cv2.pointPolygonTest(
-                                cnt[c][0], (j, i), True
-                            )
+                            dist = cv2.pointPolygonTest(cnt[c][0], (j, i), True)
                             if not c_neighbor[c]:
                                 raw_dist[i, j, c] = dist
                             else:
                                 if dist < 0:
                                     raw_dist[i, j, c] = -1 * np.sqrt(
-                                        dist ** 2 + dist_between_slices ** 2
+                                        dist**2 + dist_between_slices**2
                                     )
                                 else:
-                                    raw_dist[i, j, c] = max(-1 * np.sqrt(
-                                        dist ** 2 + dist_between_slices ** 2
-                                    ), dist_between_slices * -1)
+                                    raw_dist[i, j, c] = max(
+                                        -1 * np.sqrt(dist**2 + dist_between_slices**2),
+                                        dist_between_slices * -1,
+                                    )
 
             drawing = np.zeros((ylen, xlen, 3))
             for i in range(ylen):
@@ -540,18 +539,19 @@ class SoftAssigner:
                                 )
                             elif z_global[j] in cntz_best_neighbor.keys():
                                 dist = cv2.pointPolygonTest(
-                                        cntz_best_neighbor[z_global[j]],
-                                        (x[j] - 1, y[j] - 1),
-                                        True,
+                                    cntz_best_neighbor[z_global[j]],
+                                    (x[j] - 1, y[j] - 1),
+                                    True,
                                 )
                                 if dist < 0:
                                     dist = -1 * np.sqrt(
-                                        dist ** 2 + dist_between_slices ** 2
+                                        dist**2 + dist_between_slices**2
                                     )
                                 else:
-                                    dist = max(-1 * np.sqrt(
-                                        dist ** 2 + dist_between_slices ** 2
-                                    ), dist_between_slices * -1)
+                                    dist = max(
+                                        -1 * np.sqrt(dist**2 + dist_between_slices**2),
+                                        dist_between_slices * -1,
+                                    )
 
                             if dist is not None and dist > -1 * max_dist:
                                 cell_ids[j] = dict(
@@ -1207,6 +1207,7 @@ class SoftAssigner:
         assigned_col="assignment",
         omit_blanks=False,
         auto_assign_single_target=False,
+        save_delta_tallies=False,
         disable_tqdm=False,
     ):
         """
@@ -1303,7 +1304,13 @@ class SoftAssigner:
                     # all cells present and we are not explicitly treating them
                     # as "other"
                     if not use_other_cells and any(
-                        [(cell not in self.cell_to_type.keys() or self.cell_to_type[cell] == "Unassigned") for cell in unconf_tup]
+                        [
+                            (
+                                cell not in self.cell_to_type.keys()
+                                or self.cell_to_type[cell] == "Unassigned"
+                            )
+                            for cell in unconf_tup
+                        ]
                     ):
                         skip_cached.append(unconf_tup)
                         self.logger.info(
@@ -1549,9 +1556,7 @@ class SoftAssigner:
         # create new column for tr dataframe where row is transcript ID and value is cell assignment
         new_col = tr.apply(
             lambda b: (
-                inv_assignment[b.name]
-                if b.name in inv_assignment.keys()
-                else np.nan
+                inv_assignment[b.name] if b.name in inv_assignment.keys() else np.nan
             ),
             axis=1,
         )
@@ -1560,6 +1565,41 @@ class SoftAssigner:
         # last bit of cleanup before we save it:
         tr = tr.loc[:, ~tr.columns.str.contains("^Unnamed")]
         tr.to_csv(self.complete_csv_name.format(f), sep=",")
+
+        # save deltas while we're here
+        if save_delta_tallies:
+            deltas = {}
+            final_trs = {}
+            for c in tr[assigned_col].astype("category").cat.categories:
+                ex = tr[tr[assigned_col] == c].index
+                final_trs[str(int(c))] = list(ex)
+
+            for cell, trs in assigned_trs.items():
+                if cell not in deltas.keys():
+                    deltas[cell] = [0, 0, 0, 0]
+
+                for trid in trs:
+                    original = ast.literal_eval(tr.loc[[trid]]["cell_ids"].values[0])
+                    original = self.assign_to_cell(original)
+
+                    if original != str(cell):
+                        deltas[cell][0] += 1
+                        deltas[cell][2] += 1
+                        if original is not None:
+                            if original not in deltas.keys():
+                                deltas[original] = [0, 1, 1, 0]
+                            else:
+                                deltas[original][1] += 1
+                                deltas[original][2] += 1
+
+                deltas[cell][3] = len(final_trs[cell])
+
+            for cell in list(set(final_trs.keys()) - set(deltas.keys())):
+                deltas[cell] = [0, 0, 0, len(final_trs[cell])]
+
+            dict_loc = f"{self.complete_loc}delta_tallies_{assigned_col}_fov_{f:0>4}.pydict"
+            with open(dict_loc, "w") as fl:
+                fl.write(str(assigned_trs))
 
         # this is too big to keep in memory if we're a part of a pool
         # that's running everything. So, delete if we are in a pool.
@@ -1582,9 +1622,10 @@ class SoftAssigner:
         use_conf_trs=False,
         use_other_cells=False,
         use_mse_score=False,
-        auto_assign_single_target=False,
         assigned_col="assignment",
         omit_blanks=False,
+        auto_assign_single_target=False,
+        save_delta_tallies=False,
     ):
         """
         Runner for evaluate_overlapping_regions_single
@@ -1623,6 +1664,7 @@ class SoftAssigner:
                             repeat(assigned_col),
                             repeat(omit_blanks),
                             repeat(auto_assign_single_target),
+                            repeat(save_delta_tallies),
                             repeat(True),
                         ),
                     )
