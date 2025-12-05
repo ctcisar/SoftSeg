@@ -96,11 +96,22 @@ class SegImagePlotter:
 
         return i
 
-    def load_fov(self, fov):
+    def load_fov(self, fov, exposure_eq=False):
+        """
+        exposure_eq: if True, will use skimage.exposure method for normaliztion
+        """
         self.masks = skimage.io.imread(self.mask_str.format(fov))
-        self.image = skimage.exposure.equalize_hist(
-            skimage.io.imread(self.seg_str.format(fov))
-        )
+        if exposure_eq:
+            self.image = skimage.exposure.equalize_hist(
+                skimage.io.imread(self.seg_str.format(fov))
+            )
+        else:
+            temp = skimage.io.imread(self.seg_str.format(fov))
+            self.image = np.zeros(np.shape(temp))
+            for z in range(np.shape(temp)[0]):
+                layer = temp[z]
+                layer = (layer - np.min(layer)) / np.max(layer)
+                self.image[z] = layer
 
     def mask_from_img(self, ind):
         return (self.masks == ind + 1).astype(np.uint8)
@@ -112,12 +123,20 @@ class SegImagePlotter:
             slice(cross["y0"], cross["y1"]),
         )
 
-    def plot_subset(self, target_cell=None, highlight_cells=None, adata=None, highlight_type=None):
+    def plot_subset(
+        self,
+        target_cell=None,
+        highlight_cells=None,
+        adata=None,
+        highlight_type=None,
+        single_channel=None,
+    ):
         """
         target_cell: if provided, will zoom in on that cell specifically
         highlight_cells: cell ids listed will be highlighted in red
         adata: anndata with cell ids and other information. Only needed for highlight_types
         highlight_type: cells that match this type will be highlighted in white
+        single_channel: if provided, only this channel of the segmentation image will be usd
         """
         if self.masks is None:
             raise Exception("load_fov must be called before performing this operation.")
@@ -143,13 +162,11 @@ class SegImagePlotter:
                     cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)[0]
                 )
 
-                if (
-                    highlight_cells is not None
-                    and c - 1 in highlight_cells
-                ):
+                if highlight_cells is not None and c - 1 in highlight_cells:
                     color = (1, 0, 0)
                 elif (
-                    adata is not None and highlight_type is not None
+                    adata is not None
+                    and highlight_type is not None
                     and str(c - 1) in adata.obs.index
                     and adata.obs.loc[str(c - 1)]["celltypes"] == highlight_type
                 ):
@@ -163,5 +180,8 @@ class SegImagePlotter:
                 this_img = cv2.drawContours(
                     this_img, contours[i], 0, contour_color[i], 1
                 )
-            plt.imshow(this_img)
+            if single_channel is None:
+                plt.imshow(this_img)
+            else:
+                plt.imshow(this_img[:, :, single_channel])
             plt.show()
