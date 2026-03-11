@@ -216,6 +216,7 @@ class SoftAssigner:
                         results[int(c)] = f
                         if len(results) == len(cell_ids):
                             return results
+                        cell_ids.remove(c)
         return results
 
     def plot_completed_cell(self, fov, cells, dist_between_slices=None, tr_hi=None):
@@ -255,10 +256,10 @@ class SoftAssigner:
         sel_tr = pd.DataFrame(sel_tr)
 
         # find our bounding box
-        x_0 = np.nanmin(sel_tr["x"]) - 10
-        x_1 = np.nanmax(sel_tr["x"]) + 10
-        y_0 = np.nanmin(sel_tr["y"]) - 10
-        y_1 = np.nanmax(sel_tr["y"]) + 10
+        x_0 = max(np.nanmin(sel_tr["x"]) - 10, 0)
+        x_1 = min(np.nanmax(sel_tr["x"]) + 10, np.shape(im)[-2])
+        y_0 = max(np.nanmin(sel_tr["y"]) - 10, 0)
+        y_1 = min(np.nanmax(sel_tr["y"]) + 10, np.shape(im)[-1])
 
         im8 = [(im == cell + 1).astype(np.uint8)[:, y_0:y_1, x_0:x_1] for cell in cells]
 

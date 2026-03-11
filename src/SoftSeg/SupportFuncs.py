@@ -116,11 +116,16 @@ class SegImagePlotter:
     def mask_from_img(self, ind):
         return (self.masks == ind + 1).astype(np.uint8)
 
-    def cross_to_slice(cross):
+    def cross_to_slice(self, cross):
+        # TODO: calculate xmax and ymax from self and then use those for the upper bounds!!
+        xmax = np.shape(self.masks)[-2] - 1
+        ymax = np.shape(self.masks)[-1] - 1
+        zmin = min(cross["zs"])
+        zmax = max(cross["zs"]) + 1
         return (
-            slice(min(cross["zs"]), max(cross["zs"])),
-            slice(cross["x0"], cross["x1"]),
-            slice(cross["y0"], cross["y1"]),
+            slice(zmin, zmax),
+            slice(max(cross["x0"], 0), min(cross["x1"], xmax)),
+            slice(max(cross["y0"], 0), min(cross["y1"], ymax)),
         )
 
     def plot_subset(
@@ -143,7 +148,7 @@ class SegImagePlotter:
         if target_cell is not None:
             mask = self.mask_from_img(target_cell)
             cross = SegImagePlotter.get_range_dict(mask, border=100)
-            crossection = SegImagePlotter.cross_to_slice(cross)
+            crossection = self.cross_to_slice(cross)
             image_sub = self.image[crossection].copy()
             mask_sub = self.masks[crossection].copy()
         else:
