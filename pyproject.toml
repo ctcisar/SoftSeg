@@ -29,6 +29,7 @@ dependencies = [
     "pandas",
     "parse",
     "pathspec>=0.10.1",
+    "requests",
     "scanpy",
     "scikit-image"
 ]

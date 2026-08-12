@@ -2,6 +2,7 @@ import ast
 import glob
 import logging
 import multiprocessing
+import os
 import random
 from collections import Counter
 from contextlib import closing
@@ -23,7 +24,7 @@ from matplotlib.patches import Circle
 #  from memory_profiler import profile
 from skimage.measure import regionprops
 from skimage.segmentation import clear_border
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 
 def sigm(x, x0=0, k=0.05):
@@ -123,6 +124,9 @@ class SoftAssigner:
         self.complete_csv_name = f"{complete_loc}fov_{{:0>4}}_cellids.csv"
         self.pool_size = pool_size
         self.logger = logging.getLogger()
+        if not os.path.isdir(complete_loc):
+            os.makedirs(complete_loc)
+
         logging.basicConfig(
             filename=f"{complete_loc}{datetime.now()}run.log",
             level=logging.DEBUG,
@@ -219,7 +223,7 @@ class SoftAssigner:
                         cell_ids.remove(c)
         return results
 
-    def plot_completed_cell(self, fov, cells, dist_between_slices=None, tr_hi=None):
+    def plot_completed_cell(self, fov, cells, gene_col_name="gene", dist_between_slices=None, tr_hi=None):
         """
         tr_hi formatting:
         OPTIONAL dict key: color to use, values are dicts below:
@@ -233,7 +237,7 @@ class SoftAssigner:
         sel_tr = []
         for r, row in tr.iterrows():
             assigned = ast.literal_eval(row["cell_ids"])
-            if "lank" not in row["gene"] and any(
+            if "lank" not in row[gene_col_name] and any(
                 [str(cell) in assigned.keys() for cell in cells]
             ):
                 cs = [0, 0, 0]
@@ -249,17 +253,17 @@ class SoftAssigner:
                         "c0": cs[0],
                         "c1": cs[1],
                         "c2": cs[2],
-                        "gene": row["gene"],
+                        "gene": row[gene_col_name],
                         "index": row["index"],
                     }
                 )
         sel_tr = pd.DataFrame(sel_tr)
 
         # find our bounding box
-        x_0 = max(np.nanmin(sel_tr["x"]) - 10, 0)
-        x_1 = min(np.nanmax(sel_tr["x"]) + 10, np.shape(im)[-2])
-        y_0 = max(np.nanmin(sel_tr["y"]) - 10, 0)
-        y_1 = min(np.nanmax(sel_tr["y"]) + 10, np.shape(im)[-1])
+        x_0 = int(max(np.nanmin(sel_tr["x"]) - 10, 0))
+        x_1 = int(min(np.nanmax(sel_tr["x"]) + 10, np.shape(im)[-2]))
+        y_0 = int(max(np.nanmin(sel_tr["y"]) - 10, 0))
+        y_1 = int(min(np.nanmax(sel_tr["y"]) + 10, np.shape(im)[-1]))
 
         im8 = [(im == cell + 1).astype(np.uint8)[:, y_0:y_1, x_0:x_1] for cell in cells]
 
@@ -659,7 +663,7 @@ class SoftAssigner:
         if total == 0:
             return None
         for k, v in assigned.items():
-            if (min_thresh is None or float(v) / total > min_thresh) and float(v) > 0.5:
+            if (min_thresh is None or float(v) / total > min_thresh) and float(v) >= 0.5:
                 return k
         return None
 
@@ -831,6 +835,7 @@ class SoftAssigner:
 
     def convert_to_adata(
         self,
+        gene_col_name="gene",
         min_thresh=None,
         assigned_col=None,
         fov_locs=None,
@@ -874,13 +879,13 @@ class SoftAssigner:
                     )
                     continue
                 tr = tr[~pd.isnull(tr[assigned_col])]
-                tallies = Counter(list(zip(tr["gene"], tr[assigned_col])))
+                tallies = Counter(list(zip(tr[gene_col_name], tr[assigned_col])))
             else:
                 cell_col = tr.cell_ids.apply(
                     lambda x: self.assign_to_cell(ast.literal_eval(x), min_thresh)
                 )
                 inds = cell_col.apply(lambda x: x is not None)
-                tallies = Counter(list(zip(tr["gene"][inds], cell_col[inds])))
+                tallies = Counter(list(zip(tr[gene_col_name][inds], cell_col[inds])))
 
             for tup, tally in tallies.items():
                 gene, cell = tup
@@ -898,7 +903,6 @@ class SoftAssigner:
             self.logger.info(f"[{datetime.now()}] completed reading in fov_{f:0>4}.")
 
         cxg_df = pd.DataFrame.from_dict(cxg_dict, orient="index")
-        cxg_df
 
         adata = ad.AnnData(cxg_df)
 
@@ -997,7 +1001,7 @@ class SoftAssigner:
         dat = datetime.today().strftime("%Y%m%d_%H%M")
         filename = f"{self.complete_loc}cxg_adata_{dat}"
         if assigned_col is not None:
-            filename += "_resegmented"
+            filename += f"_resegmented_{assigned_col}"
         filename += ".h5ad"
 
         adata.write(filename)
@@ -1081,6 +1085,43 @@ class SoftAssigner:
                         score += self.score_mat[gene][cell_type]
         return score
 
+    def score_dataset(self, adata, include_other=True):
+        """
+        Computes an overall score for a dataset by summing, for each cell, the
+        score_mat value for each (gene, cell_type) pair weighted by the gene's
+        count in that cell. Requires get_scoring_matrix to have been run first.
+
+        Returns a dict with:
+            "total": raw sum of scores across all cells
+            "per_cell": total / number of cells
+            "per_transcript": total / total transcript count
+        """
+        score_df = pd.DataFrame.from_dict(self.score_mat)
+        # restrict to genes present in both adata and score_mat
+        shared_genes = [g for g in adata.var_names if g in score_df.columns]
+        score_df = score_df[shared_genes]
+
+        counts = adata[:, shared_genes].to_df()
+
+        total = 0.0
+        for cell_id, row in counts.iterrows():
+            cell_type = self.cell_to_type.get(cell_id, "other")
+            if cell_type not in score_df.index:
+                cell_type = "other"
+
+            if cell_type != "other" or include_other:
+                scores = score_df.loc[cell_type]
+                total += float(row.dot(scores))
+
+        n_cells = len(adata)
+        n_transcripts = float(counts.values.sum())
+
+        return {
+            "total": total,
+            "per_cell": total / n_cells if n_cells > 0 else 0.0,
+            "per_transcript": total / n_transcripts if n_transcripts > 0 else 0.0,
+        }
+
     def trs_at_thresh(self, thresh, sel_cells, todo_trs, all_trs, sel_index=0):
         """
         Given a set of ambiguous transcripts and their relative assignment scores,
@@ -1149,6 +1190,10 @@ class SoftAssigner:
             i_cell = c_cell
             sel_cells.remove(sel_cells[0])
 
+        if len(sel_cells) == 0:
+            # CRITICAL ERROR
+            return False
+
         # for the last cell, just assign everything that's left
         last_cell = str(sel_cells[0])
         last_trs = list(todo_trs[last_cell][:, 0])
@@ -1199,6 +1244,7 @@ class SoftAssigner:
     def evaluate_overlapping_regions_single_fov(
         self,
         f,
+        gene_col_name="gene",
         min_thresh=None,
         default_thresh=5,
         only_tagged_cells=None,
@@ -1210,6 +1256,7 @@ class SoftAssigner:
         auto_assign_single_target=False,
         save_delta_tallies=False,
         disable_tqdm=False,
+        overwrite=False,
     ):
         """
         Scores and re-assigns border region transcripts for a single FOV.
@@ -1230,9 +1277,10 @@ class SoftAssigner:
             eligible target cell will automatically be assigned to that cell.
         disable_tqdm (bool): if True, this method will not print output or  create
             its own pbar entities.
+        overwrite (bool): if True, this method will overwite assigned_col if it already exists.
         """
         tr = pd.read_csv(self.complete_csv_name.format(f), index_col=0)
-        if assigned_col in tr.columns:
+        if assigned_col in tr.columns and not overwrite:
             self.logger.info(
                 f"[{datetime.now()}] skipping fov_{f:0>4}, {assigned_col} already present"
             )
@@ -1251,6 +1299,10 @@ class SoftAssigner:
         #               ^ will be converted to np.array later
 
         skip_cached = []  # comparison tuples that we know we don't care about
+
+        seg_is_default = {}
+        # key: unconf_tup
+        # value: True if using original masks, False if using novel mask
 
         assigned_trs = {}
         # key: cell
@@ -1271,7 +1323,7 @@ class SoftAssigner:
                 pbar.update(1)
 
             # omit blanks
-            if omit_blanks and "lank" in row["gene"]:
+            if omit_blanks and "lank" in row[gene_col_name]:
                 continue
 
             assigned = ast.literal_eval(row["cell_ids"])
@@ -1288,7 +1340,7 @@ class SoftAssigner:
 
                 # try to assign to a single cell
                 conf_cell = self.assign_to_cell(assigned, min_thresh)
-                self.tr_to_gene[index] = row["gene"]
+                self.tr_to_gene[index] = row[gene_col_name]
                 if conf_cell is not None:
                     # transcript has confident assignment
                     if conf_cell in conf_trs.keys():
@@ -1296,8 +1348,19 @@ class SoftAssigner:
                     else:
                         conf_trs[conf_cell] = [index]
                 else:
-                    # dealing with a non-confident transcript
                     unconf_tup = tuple(sorted([k for k in assigned.keys()]))
+                    if unconf_tup not in unconf_trs.keys():
+                        unconf_trs[unconf_tup] = {}
+
+                    # adding values of each possible assignment to proper dict entry
+                    for cell, prob in assigned.items():
+                        tr_val = (index, prob)
+                        if cell in unconf_trs[unconf_tup].keys():
+                            unconf_trs[unconf_tup][cell].append(tr_val)
+                        else:
+                            unconf_trs[unconf_tup][cell] = [tr_val]
+
+                    # dealing with a non-confident transcript
                     if unconf_tup in skip_cached:
                         continue
 
@@ -1314,6 +1377,7 @@ class SoftAssigner:
                         ]
                     ):
                         skip_cached.append(unconf_tup)
+                        seg_is_default[unconf_tup] = [True]
                         self.logger.info(
                             f"Throwing out tuple {unconf_tup}, contains untyped cell."
                         )
@@ -1351,24 +1415,15 @@ class SoftAssigner:
                             self.logger.info(
                                 f"Assigning transcript {index} to unconfident but unambiguous cell assignment {unconf_tup}."
                             )
+                            seg_is_default[unconf_tup] = [True]
                             continue
                         else:
                             skip_cached.append(unconf_tup)
+                            seg_is_default[unconf_tup] = [True]
                             self.logger.info(
                                 f"Throwing out tuple {unconf_tup}, contains single cell type."
                             )
                             continue
-
-                    if unconf_tup not in unconf_trs.keys():
-                        unconf_trs[unconf_tup] = {}
-
-                    # adding values of each possible assignment to proper dict entry
-                    for cell, prob in assigned.items():
-                        tr_val = (index, prob)
-                        if cell in unconf_trs[unconf_tup].keys():
-                            unconf_trs[unconf_tup][cell].append(tr_val)
-                        else:
-                            unconf_trs[unconf_tup][cell] = [tr_val]
 
         if pbar is not None:
             pbar.close()
@@ -1384,10 +1439,6 @@ class SoftAssigner:
 
         max_len = max([len(k) for k in unconf_trs.keys()])
 
-        seg_is_default = {}
-        # key: unconf_tup
-        # value: True if using original masks, False if using novel mask
-
         if not disable_tqdm:
             print("\tassigning unconfident transcripts...")
             pbar = tqdm(total=len(unconf_trs))
@@ -1402,6 +1453,11 @@ class SoftAssigner:
 
                 if pbar is not None:
                     pbar.update(1)
+
+                # if this tuple is only in there because we want to treat it as
+                # default, don't actually compute any threshes for it
+                if unconf_tup in seg_is_default:
+                    continue
 
                 elg_cells = list(unconf_tup)
 
@@ -1475,6 +1531,10 @@ class SoftAssigner:
                                 thresh, elg_cells, tr_by_cell, tr, prim_ind
                             )
 
+                            if assignment is False:
+                                self.logger.error(f"CRITICAL PROBLEM.\nfov: {f}\nelg_cells: {elg_cells}\nunconf_tup: {unconf_tup}\ntr_by_cell: {tr_by_cell}")
+                                break
+
                             if use_conf_trs:
                                 assignment = self.dict_merge(
                                     assignment, conf_trs, elg_cells
@@ -1527,6 +1587,22 @@ class SoftAssigner:
                                 )
                             else:
                                 assigned_trs[cell] = [float(t) for t in actual_trs]
+        # print([k for k in unconf_trs.keys()])
+
+        # assign things that were left as default
+        for unconf_tup, is_default in seg_is_default.items():
+            if is_default:
+                if unconf_tup in unconf_trs:
+                    og_assignment = self.trs_at_default(unconf_trs[unconf_tup])
+                    for cell, trs in og_assignment.items():
+                        # "other" assignments were for one-way comparisons
+                        if cell != "other":
+                            if cell in assigned_trs:
+                                assigned_trs[cell].extend(trs)
+                            else:
+                                assigned_trs[cell] = trs
+                else:
+                    print(f"{unconf_tup} does not have corresponding trs list")
 
         if pbar is not None:
             pbar.close()
@@ -1563,6 +1639,33 @@ class SoftAssigner:
         )
         tr[assigned_col] = new_col
 
+        # adding some simple tracking columns to make later analysis easier
+        tr["og_cell"] = tr.apply(
+            lambda b: (
+                str(int(self.assign_to_cell(ast.literal_eval(b["cell_ids"]))))
+                if b["cell_ids"] is not None
+                and self.assign_to_cell(ast.literal_eval(b["cell_ids"])) is not None
+                else "None"
+            ),
+            axis=1,
+        )
+        tr["og_type"] = tr.apply(
+            lambda b: (
+                self.cell_to_type[b["og_cell"]]
+                if b["og_cell"] in self.cell_to_type
+                else "None"
+            ),
+            axis=1,
+        )
+        tr[f"{assigned_col}_type"] = tr.apply(
+            lambda b: (
+                self.cell_to_type[b[assigned_col]]
+                if b[assigned_col] in self.cell_to_type
+                else "None"
+            ),
+            axis=1,
+        )
+
         # last bit of cleanup before we save it:
         tr = tr.loc[:, ~tr.columns.str.contains("^Unnamed")]
         tr.to_csv(self.complete_csv_name.format(f), sep=",")
@@ -1598,7 +1701,9 @@ class SoftAssigner:
             for cell in list(set(final_trs.keys()) - set(deltas.keys())):
                 deltas[cell] = [0, 0, 0, len(final_trs[cell])]
 
-            dict_loc = f"{self.complete_loc}delta_tallies_{assigned_col}_fov_{f:0>4}.pydict"
+            dict_loc = (
+                f"{self.complete_loc}delta_tallies_{assigned_col}_fov_{f:0>4}.pydict"
+            )
             with open(dict_loc, "w") as fl:
                 fl.write(str(assigned_trs))
 
@@ -1617,6 +1722,7 @@ class SoftAssigner:
     def evaluate_all_overlapping_regions(
         self,
         sel_fovs=None,
+        gene_col_name="gene",
         min_thresh=None,
         default_thresh=5,
         only_tagged_cells=None,
@@ -1627,6 +1733,7 @@ class SoftAssigner:
         omit_blanks=False,
         auto_assign_single_target=False,
         save_delta_tallies=False,
+        overwrite=False,
     ):
         """
         Runner for evaluate_overlapping_regions_single
@@ -1650,12 +1757,14 @@ class SoftAssigner:
         with tqdm(total=len(sel_fovs)) as pbar:
             for subset_fovs in fov_pool:
                 self.logger.info(f"[{datetime.now()}] starting sub-pool: {subset_fovs}")
-                with closing(Pool(processes=self.pool_size)) as pool:
+                pool_size = min(self.pool_size, len(subset_fovs))
+                with closing(Pool(processes=pool_size)) as pool:
                     results = pool.imap_unordered(
                         self.__func_wrapper__,
                         zip(
                             repeat(self.evaluate_overlapping_regions_single_fov),
                             subset_fovs,
+                            repeat(gene_col_name),
                             repeat(min_thresh),
                             repeat(default_thresh),
                             repeat(only_tagged_cells),
@@ -1667,7 +1776,41 @@ class SoftAssigner:
                             repeat(auto_assign_single_target),
                             repeat(save_delta_tallies),
                             repeat(True),
+                            repeat(overwrite),
                         ),
                     )
                     for result in results:
                         pbar.update(1)
+
+    def save_combined_changed_transcripts(self, assigned_col="assignment"):
+        sel_trs = None
+        for f in self.get_complete_fovs():
+            tr = pd.read_csv(self.complete_csv_name.format(f), index_col=0)
+            if assigned_col in tr:
+                # first filter to transcripts where the types are different (and not both null)
+                tr = tr.fillna("None")
+                tr = tr[
+                    (tr[f"{assigned_col}_type"] != tr["og_type"])
+                ]
+
+                # now filter down to the columns we care about
+                tr = tr[
+                    [
+                        "gene",
+                        "fov",
+                        "og_cell",
+                        "og_type",
+                        assigned_col,
+                        f"{assigned_col}_type",
+                    ]
+                ]
+
+                if sel_trs is None:
+                    sel_trs = tr
+                else:
+                    sel_trs = pd.concat([sel_trs, tr])
+                    del tr
+
+        dat = datetime.today().strftime("%Y%m%d_%H%M")
+        filename = f"{self.complete_loc}moved_trs_{dat}.csv"
+        sel_trs.to_csv(filename, sep=",")

@@ -38,7 +38,7 @@ class CellTypeAssigner:
         if adata is not None:
             self.adata = adata
         elif adata_loc is not None:
-            self.adata = ad.read(adata_loc)
+            self.adata = ad.read_h5ad(adata_loc)
             self.adata_loc = adata_loc
         else:
             Exception("Either adata object or file location must be provided.")
@@ -59,7 +59,7 @@ class CellTypeAssigner:
             return filename
 
     def load_annotated_adata(self, loc):
-        self.adata = ad.read(loc)
+        self.adata = ad.read_h5ad(loc)
 
     def filter_cells(self, adata=None, **kwargs):
         """
