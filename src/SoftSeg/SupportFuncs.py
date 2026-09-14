@@ -559,8 +559,6 @@ class ParamSweeper:
         return type_acc, cell_acc
 
     def run_unit_sweep(self, gene_col_name, unit_adata_loc, min_size=25, max_dist=3.5, default_thresh=10, min_thresh=0.8):
-
-
         if isinstance(min_size, list):
             sizes = min_size
         else:
