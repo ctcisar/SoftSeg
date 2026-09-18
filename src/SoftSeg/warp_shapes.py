@@ -413,7 +413,8 @@ def warp_shapes(
     sdata,
     warper: Warper = None,
     *,
-    elements: Iterable[str] = DEFAULT_ELEMENTS,
+    labels: str = "cells",
+    elements: Iterable[str] = None,
     suffix: str = "_warped",
     repair: bool = True,
     inplace: bool = False,
@@ -421,10 +422,11 @@ def warp_shapes(
     """
     Warp the boundaries of segmentation shapes in a SpatialData object.
 
-    Operates on the ``cell_borders`` and ``cells`` GeoDataFrame elements (by
-    default), applying the *same* ``warper`` to both so they stay consistent.
-    Geometry is warped vertex-wise; all non-geometry columns and each element's
-    coordinate transformations are preserved.
+    Operates on the cell segmentation element (``cells`` by default) and, when
+    the object has one, its matching ``cell_borders``, applying the *same*
+    ``warper`` to both so they stay consistent. Geometry is warped vertex-wise;
+    all non-geometry columns and each element's coordinate transformations are
+    preserved.
 
     Parameters
     ----------
@@ -435,8 +437,16 @@ def warp_shapes(
         :func:`smooth_field_warp` with default parameters. The same callable is
         reused for every element, so a stateless field warper deforms both
         elements identically in space.
-    elements : iterable of str
-        Shapes keys to warp. Defaults to ``("cell_borders", "cells")``.
+    labels : str
+        Name of the shapes element holding the cell segmentation to warp.
+        Defaults to ``"cells"``. Name a different element for an object that
+        calls its cells something else.
+    elements : iterable of str, optional
+        The full set of shapes keys to warp, overriding the above. If not given,
+        it is ``labels`` plus any of ``("cell_borders", "cells")`` the object
+        actually has -- so a dataset carrying both a cell element and a matching
+        borders element deforms them together, and one carrying only ``labels``
+        just warps that.
     suffix : str
         Suffix for the new element names when ``inplace`` is False.
     repair : bool
@@ -454,6 +464,11 @@ def warp_shapes(
     """
     if warper is None:
         warper = smooth_field_warp()
+
+    if elements is None:
+        elements = [labels] + [
+            e for e in DEFAULT_ELEMENTS if e != labels and e in sdata.shapes
+        ]
 
     missing = [e for e in elements if e not in sdata.shapes]
     if missing:

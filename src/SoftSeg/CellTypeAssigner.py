@@ -1,5 +1,4 @@
 from collections import Counter
-from datetime import datetime
 
 import anndata as ad
 import matplotlib
@@ -7,7 +6,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import requests
 import scanpy as sc
-from tqdm import tqdm
+from tqdm.auto import tqdm
+
+from SoftSeg.SpatialDataHelpers import SpatialDataHelpers
 
 
 def download_lung_dataset(filepath):
@@ -31,35 +32,63 @@ def download_lung_dataset(filepath):
 
 class CellTypeAssigner:
     def __init__(
-        self, ref_levels, ann_levels, adata_loc=None, adata=None, verbose=True
+        self, ref_levels, ann_levels, adata=None, sdata=None, table_name=None,
+        verbose=True
     ):
-        self.ref_levels = ref_levels  # list of columns to look at for celltype labels in ref data
-        self.ann_levels = ann_levels  # list of columns to assign celltypes target adata
+        """
+        ref_levels: columns to look at for celltype labels in the reference data
+        ann_levels: columns to assign celltypes on the target adata
+
+        The target cell-by-gene data comes either as `adata` directly, or as
+        `table_name` naming a table in `sdata` -- which is where
+        `SoftAssigner.convert_to_adata` leaves its results. Passing `sdata` also
+        lets `save_annotated_adata` put the annotated result back into the store.
+        """
+        self.ref_levels = ref_levels
+        self.ann_levels = ann_levels
+        self.sdata = sdata
+        self.table_name = table_name
+
         if adata is not None:
             self.adata = adata
-        elif adata_loc is not None:
-            self.adata = ad.read_h5ad(adata_loc)
-            self.adata_loc = adata_loc
+        elif sdata is not None and table_name is not None:
+            self.adata = sdata.tables[table_name]
         else:
-            Exception("Either adata object or file location must be provided.")
+            raise ValueError(
+                "Provide either an `adata` object, or `sdata` plus the "
+                "`table_name` of the cell-by-gene table within it."
+            )
         self.verbose = verbose
 
-    def save_annotated_adata(self):
-        if self.adata_loc is None:
-            print("Requires `adata_loc` to be set.")
-        else:
-            dat = datetime.today().strftime("%Y%m%d")
-            if ".h5ad" in self.adata_loc:
-                newloc = "/".join(self.adata_loc.split("/")[:-1])
-                filename = f"{newloc}/cxg_adata_celltypes_{dat}.h5ad"
-            else:
-                filename = f"{self.adata_loc}/cxg_adata_highlevel_wpca_{dat}.h5ad"
-            self.adata.write_h5ad(filename)
-            print(f"Saved {filename}")
-            return filename
+    def save_annotated_adata(self, table_name=None):
+        """Store the annotated adata as a table in the sdata, and save it.
 
-    def load_annotated_adata(self, loc):
-        self.adata = ad.read_h5ad(loc)
+        Defaults to overwriting the table it was read from; pass `table_name` to
+        keep the annotated version alongside the original.
+        """
+        if self.sdata is None:
+            raise ValueError(
+                "No sdata attached, so there is nowhere to save to. Build this "
+                "CellTypeAssigner with `sdata=` (and `table_name=`), or take "
+                "`.adata` and store it yourself."
+            )
+        name = table_name or self.table_name
+        if name is None:
+            raise ValueError(
+                "No table name to save under: pass `table_name`, or build this "
+                "CellTypeAssigner with one."
+            )
+        self.sdata.tables[name] = self.adata
+        SpatialDataHelpers.save_element(self.sdata, name)
+        print(f"Saved table {name!r}")
+        return name
+
+    def load_annotated_adata(self, table_name):
+        """Re-read the target adata from a table in the sdata."""
+        if self.sdata is None:
+            raise ValueError("No sdata attached to read a table from.")
+        self.adata = self.sdata.tables[table_name]
+        self.table_name = table_name
 
     def filter_cells(self, adata=None, **kwargs):
         """

@@ -2,34 +2,64 @@
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+# Scratch/experimental files that are not part of the package API, so they are
+# kept out of both the sdist and the wheel (and therefore out of an install
+# built from either).
+exclude = [
+    "src/SoftSeg/codedump.py",
+    "src/SoftSeg/test.py",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/SoftSeg"]
 
 [project]
 name = "SoftSeg"
-version = "0.2.2"
+version = "0.3.0"
 authors = [
   { name="Cecilia Cisar", email="ccisar@ucsc.edu" },
 ]
-description = "A small example package"
+description = "Soft transcript-to-cell assignment for spatial transcriptomics"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 dependencies = [
     "anndata",
-    "tqdm",
-    "opencv-python",
+    "dask[array]",
+    "geopandas",
     "matplotlib",
-    "seaborn",
     "numpy",
+    "opencv-python",
     "pandas",
     "parse",
-    "pathspec>=0.10.1",
     "requests",
     "scanpy",
-    "scikit-image"
+    # vectorised shapely.distance / shapely.contains_xy
+    "shapely>=2.0",
+    "scikit-image",
+    # delete_element_from_disk, get_centroids, SpatialData.is_backed
+    "spatialdata>=0.5",
+    "tifffile",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+# Only SupportFuncs.NeighborPredictor needs these; they are a heavy install, so
+# they are kept out of the base requirements.
+neighbors = [
+    "scikit-learn",
+    "torch",
+]
+test = [
+    "pytest",
 ]

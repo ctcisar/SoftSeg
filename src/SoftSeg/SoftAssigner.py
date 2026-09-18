@@ -1,15 +1,12 @@
 import ast
-import glob
 import logging
 import multiprocessing
-import os
 import random
 from collections import Counter
 from contextlib import closing
 from copy import deepcopy
 from datetime import datetime
 from itertools import repeat
-from multiprocessing import Pool
 from pathlib import Path
 
 import anndata as ad
@@ -17,149 +14,484 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import parse
-import skimage
-import skimage.io
+import shapely
 from matplotlib.patches import Circle
 #  from memory_profiler import profile
-from skimage.measure import regionprops
-from skimage.segmentation import clear_border
+from spatialdata import get_centroids, read_zarr
+from spatialdata.models import PointsModel
+from spatialdata.transformations import get_transformation
 from tqdm.auto import tqdm
+
+from .SpatialDataHelpers import SpatialDataHelpers
+
+# The SoftAssigner instance the current worker process is bound to. Set once per
+# worker by ``_init_worker`` so a pooled run pickles the assigner (and with it
+# any in-memory part of the SpatialData) once per process rather than once per
+# FOV -- see ``SoftAssigner.__getstate__``.
+_WORKER_ASSIGNER = None
+
+
+def _init_worker(assigner):
+    global _WORKER_ASSIGNER
+    _WORKER_ASSIGNER = assigner
+
+
+def _run_worker(args):
+    """Call ``func(assigner, *rest)`` on the assigner this worker is bound to.
+
+    ``func`` is the plain (unbound) method — e.g. ``SoftAssigner.blur_fov`` —
+    which pickles as a reference to itself, so no copy of the assigner (and
+    therefore none of the SpatialData) rides along with each task.
+    """
+    func, rest = args[0], args[1:]
+    return func(_WORKER_ASSIGNER, *rest)
 
 
 def sigm(x, x0=0, k=0.05):
     return 1 / (1 + np.e ** (-1 * k * (x - x0)))
 
 
-def size_filter(im, min_size=None, max_size=None):
-    """Removes all items from mask that do not meet size requirements.
+def signed_distance(geom, xs, ys):
+    """Signed distance from points to a polygon.
 
-    im: Labelled input image
-    min_size: minimum size for a mask, in pixels.
-    max_size: maximum size for a mask, in pixels.
-
-    returns: Labelled image without out-of-range-sized masks.
+    Positive inside the geometry, negative outside, magnitude being the distance
+    to the nearest edge. Vectorised over ``xs``/``ys`` (1D arrays). A
+    ``MultiPolygon`` -- a cell whose slice has several disjoint pieces -- is
+    measured as a whole, against the nearest edge of any of its parts.
     """
-    props = regionprops(im)
-    to_del = []
-    for region in props:
-        if min_size is not None and region.area < min_size:
-            to_del.append(region.label)
-        if max_size is not None and region.area > max_size:
-            to_del.append(region.label)
-
-    def will_del(y):
-        return 0 if y in to_del else y
-
-    return np.vectorize(will_del)(im)
-
-
-def getContour(tif, i):
-    binimg = deepcopy(tif)
-    binimg[binimg != i] = 0
-    binimg[binimg > 0] = 1
-    binimg = binimg.astype("uint8")
-    contours = []
-    for n in range(np.shape(binimg)[0]):
-        contours.append(
-            cv2.findContours(binimg[n, :, :], cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)[
-                -2
-            ]
-        )
-    del binimg
-    return contours, i
-
-
-def remove_border(im):
-    result = []
-    removed = set()
-    for z in im:
-        result.append(clear_border(z))
-        removed.update(set(np.unique(z)) - set(np.unique(result[-1])))
-
-    result = np.array(result)
-    # print(np.shape(result))
-
-    for r in removed:
-        result[result == r] = 0
-
-    return result
-
-
-def flatten(lis):
-    if all([not hasattr(e, "__len__") for e in lis]):
-        return lis
-    else:
-        target = []
-        for li in lis:
-            if not hasattr(li, "__len__"):
-                target.append(li)
-            else:
-                target.extend(flatten(li))
-        return target
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    dist = shapely.distance(geom.boundary, shapely.points(xs, ys))
+    return np.where(shapely.contains_xy(geom, xs, ys), dist, -dist)
 
 
 class SoftAssigner:
     def __init__(
         self,
-        csv_loc,
-        im_loc,
-        complete_loc,
+        sdata,
         pool_size=1,
         conf_thresh=0.7,
         decay_func=None,
     ):
         """Initialize internal parameters.
 
-        csv_loc: location of transcript file, per fov.
-        im_loc: location of image mask tiff, per fov.
-        complete_loc: location of output files. NOT per fov: a string
-           for each fov's modified transcript table will be appended.
+        sdata: the dataset, as a single `spatialdata.SpatialData` object (or a
+           path to a zarr store holding one), in the layout produced by
+           `SpatialDataHelpers.softseg_to_spatialdata`:
+             - `sdata.labels[f"{fov}_labels"]` — the FOV's segmentation mask,
+               2D `(y, x)` or 3D `(z, y, x)`.
+             - `sdata.points[f"{fov}_points"]` — the FOV's transcript table.
+             - `sdata.shapes[f"{fov}_z{z}_shapes"]` — (optional) per-z-slice cell
+               polygons. Generated on demand with
+               `SpatialDataHelpers.masks_to_shapes` when absent.
 
-        All of these variables will be formatted with `.format(fov_number)`.
+        This object is both the input and the output: results are written back
+        into it as new columns on the points elements and as tables, and every
+        element that changes is saved to the zarr store the object came from.
+        An sdata with no store on disk is worked on purely in memory.
+
+        Passing a zarr-backed `sdata` is required when `pool_size > 1`: workers
+        re-open the store themselves and save their own FOV's element, which is
+        the only way their results get back to the parent.
         """
-        self.csv_loc = csv_loc
-        self.im_loc = im_loc
-        self.complete_loc = complete_loc
-        self.complete_csv_name = f"{complete_loc}fov_{{:0>4}}_cellids.csv"
+        self._set_sdata(sdata)
         self.pool_size = pool_size
         self.logger = logging.getLogger()
-        if not os.path.isdir(complete_loc):
-            os.makedirs(complete_loc)
-
-        logging.basicConfig(
-            filename=f"{complete_loc}{datetime.now()}run.log",
-            level=logging.DEBUG,
-        )
         self.conf_thresh = conf_thresh
         if decay_func is None:
             self.decay_func = sigm
         else:
             self.decay_func = decay_func
 
+        # The run log sits next to the store, the one location this object
+        # already owns; an in-memory sdata gets no log file and leaves logging
+        # configuration to the caller.
+        if self._sdata_path is not None:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            logging.basicConfig(
+                filename=f"{str(self._sdata_path).rstrip('/')}.{stamp}.run.log",
+                level=logging.DEBUG,
+            )
+
+    # ----------------------------------------------------------------- #
+    # SpatialData access                                                 #
+    # ----------------------------------------------------------------- #
+
+    def _set_sdata(self, sdata):
+        """Bind the assigner to a SpatialData object or an on-disk zarr store."""
+        if isinstance(sdata, (str, Path)):
+            self._sdata_path = str(sdata)
+            self._sdata = None  # opened lazily
+        else:
+            self._sdata = sdata
+            path = getattr(sdata, "path", None)
+            backed = sdata.is_backed() if hasattr(sdata, "is_backed") else False
+            self._sdata_path = str(path) if (backed and path is not None) else None
+
+    @property
+    def sdata(self):
+        """The bound SpatialData, opened from disk on first use if backed."""
+        if self._sdata is None:
+            if self._sdata_path is None:
+                raise RuntimeError(
+                    "This SoftAssigner has no SpatialData attached; pass one to "
+                    "__init__ or call _set_sdata()."
+                )
+            self._sdata = read_zarr(Path(self._sdata_path))
+        return self._sdata
+
+    def _reload_sdata(self):
+        """Drop the in-memory view so the next access re-reads it from disk.
+
+        Worker processes save their own elements to the store, which the parent's
+        already-open object knows nothing about -- and its lazy elements still
+        point at zarr paths the workers have since rewritten. Re-reading after a
+        pooled run is what makes their results visible here.
+        """
+        if self._sdata_path is not None:
+            self._sdata = None
+
+    def save_element(self, name):
+        """Save an element back to the store the sdata came from.
+
+        Does nothing for an sdata with no store on disk -- an in-memory object
+        has no location to be saved to, and its elements live only as long as it
+        does.
+
+        Rewriting an element in place is a delete followed by a write: zarr
+        refuses to overwrite a path it is currently backing an element from. The
+        replacement must therefore already be fully in memory (built through
+        `.compute()`, as `set_transcripts` does) before this is called, or the
+        delete is refused to avoid pulling the store out from under it. The pair
+        is not atomic -- an interruption between the two leaves the element only
+        in memory, and re-running the step rewrites it.
+        """
+        saved = SpatialDataHelpers.save_element(self.sdata, name)
+        if saved:
+            self.logger.debug(f"[{datetime.now()}] saved element {name} to disk.")
+        return saved
+
+    def __getstate__(self):
+        """Don't ship the dataset to worker processes when it lives on disk."""
+        state = self.__dict__.copy()
+        if state.get("_sdata_path") is not None:
+            state["_sdata"] = None  # each worker re-opens the zarr store itself
+        return state
+
+    @staticmethod
+    def _fov_of(key, suffix):
+        return key[: -len(suffix)] if key.endswith(suffix) else key
+
+    def _labels_key(self, fov):
+        return f"{fov}_labels"
+
+    def _points_key(self, fov):
+        return f"{fov}_points"
+
+    def get_labels(self, fov):
+        """The FOV's segmentation mask as a spatialdata labels element."""
+        return self.sdata.labels[self._labels_key(fov)]
+
+    def is_3d(self, fov):
+        """True if this FOV's segmentation mask has a z axis."""
+        return "z" in getattr(self.get_labels(fov), "dims", ())
+
+    def get_mask(self, fov):
+        """The FOV's segmentation mask as a numpy array, `(z, y, x)` or `(y, x)`.
+
+        Axes are selected by label rather than position, so the result is
+        correctly oriented regardless of how the element is stored.
+        """
+        el = self.get_labels(fov)
+        if "z" in el.dims:
+            return np.asarray(el.transpose("z", "y", "x"))
+        return np.asarray(el.transpose("y", "x"))
+
+    def get_transcripts(self, fov):
+        """The FOV's transcript table as a pandas dataframe.
+
+        Carries the columns of the source transcript CSV plus what
+        `softseg_to_spatialdata` adds (`global_x`/`global_y` and the slice index
+        `z`) and what this class adds as it runs (`cell_ids`, and an assignment
+        column once overlapping regions have been evaluated). The `index` column,
+        holding the transcript id, is placed first.
+        """
+        el = self.sdata.points[self._points_key(fov)]
+        df = el.compute() if hasattr(el, "compute") else pd.DataFrame(el)
+        df = df.reset_index(drop=True)
+        if "index" in df.columns:
+            df = df[["index"] + [c for c in df.columns if c != "index"]]
+        return df
+
+    def set_transcripts(self, fov, df):
+        """Write a transcript table back into the FOV's points element.
+
+        The element is replaced by one parsed from `df` -- carrying over the
+        coordinate columns, the feature key and every coordinate transformation
+        the old one had -- and then saved, so the new columns land in the
+        element's parquet in the store. `df` must be an in-memory dataframe (what
+        `get_transcripts` returns); the element it replaces is what backs the
+        parquet being rewritten, so nothing may still be reading from it.
+
+        Columns holding python objects, such as the `{cell_id: score}` dicts in
+        `cell_ids`, have to be stored as their `str()` repr -- parquet has no
+        type for them -- and are read back the same way, via `ast.literal_eval`.
+        """
+        key = self._points_key(fov)
+        old = self.sdata.points[key]
+        transformations = get_transformation(old, get_all=True)
+        feature_key = old.attrs.get("spatialdata_attrs", {}).get("feature_key")
+
+        df = df.reset_index(drop=True)
+        coordinates = {"x": "x", "y": "y"}
+        if "z" in df.columns:
+            coordinates["z"] = "z"
+        kwargs = {}
+        if feature_key and feature_key in df.columns:
+            kwargs["feature_key"] = feature_key
+
+        self.sdata.points[key] = PointsModel.parse(
+            df,
+            coordinates=coordinates,
+            transformations=transformations,
+            **kwargs,
+        )
+        self.save_element(key)
+
+    def save_table(self, name, adata):
+        """Put an AnnData into the sdata as a table and save it."""
+        self.sdata.tables[name] = adata
+        self.save_element(name)
+        return adata
+
+    def has_column(self, fov, column):
+        """True if the FOV's transcript table already carries `column`.
+
+        Reads the parquet's schema only, not its contents.
+        """
+        key = self._points_key(fov)
+        if key not in self.sdata.points:
+            return False
+        return column in self.sdata.points[key].columns
+
+    def get_fov_affine(self, fov):
+        """The FOV's pixel -> "global" mapping, as a 4x4 `(x, y, z)` affine.
+
+        This is the transform the SpatialData's coordinate systems carry: it
+        folds in the FOV's offset within the experiment and, when a `pixel_size`
+        was encoded at conversion time, the physical scale of a voxel.
+        """
+        _, matrix = SpatialDataHelpers._labels_global_affine(self.get_labels(fov))
+        return matrix
+
+    def get_dist_between_slices(self, fov):
+        """Distance between adjacent z-slices, from the sdata's coordinate system.
+
+        Both scales are read off the labels element's "global" transform — the
+        voxel depth and the in-plane pixel size that `softseg_to_spatialdata`
+        encoded from its `pixel_size`. The z spacing is the same quantity
+        `SpatialDataHelpers.masks_to_shapes` uses to place each slice in the 3D
+        stack coordinate system, so distances measured across slices here agree
+        with the geometry stored in the object.
+
+        The result is returned **in pixels**, as the ratio of the two: cell
+        polygons live in raw pixel coordinates, so an out-of-plane distance has
+        to be in pixels as well before it can be combined with an in-plane one.
+        A dataset with no pixel size encoded is isotropic by definition and gets
+        1.0, one z-slice being one pixel deep.
+
+        Returns None for a 2D FOV, which has no slices to be spaced apart.
+        """
+        if not self.is_3d(fov):
+            return None
+        matrix = self.get_fov_affine(fov)
+        z_spacing = float(matrix[2, 2])
+        # physical length of one in-plane pixel step (the x axis of the linear part)
+        in_plane = float(np.hypot(matrix[0, 0], matrix[1, 0]))
+        if not in_plane:
+            return z_spacing
+        return z_spacing / in_plane
+
+    def valid_slices(self, fov):
+        """The z-slice indices this FOV's segmentation covers.
+
+        Taken from the `valid_z` policy `softseg_to_spatialdata` recorded in
+        `sdata.attrs` when present, else every plane of the mask.
+        """
+        recorded = SpatialDataHelpers._recorded_valid_z(self.sdata, fov)
+        if recorded:
+            return sorted(int(v) for v in recorded)
+        el = self.get_labels(fov)
+        if "z" in getattr(el, "dims", ()):
+            return list(range(int(el.sizes["z"])))
+        return [0]
+
+    def transcript_slices(self, fov, tr):
+        """Map each transcript of `tr` to the z-slice index it sits on.
+
+        Uses the same rule as `SpatialDataHelpers.aggregate_zslice_shapes` and
+        `select_zslice`: a transcript belongs to the valid slice its z rounds to,
+        and one that rounds to no valid slice is either snapped to the nearest
+        slice or marked NaN (belonging to no slice), per the `snap_z` policy
+        recorded in `sdata.attrs`. A 2D FOV puts everything on slice 0.
+        """
+        allowed = np.asarray(self.valid_slices(fov), dtype=float)
+        z_col = "z" if "z" in tr.columns else None
+        if z_col is None and "global_z" in tr.columns:
+            z_col = "global_z"
+        if not self.is_3d(fov) or z_col is None:
+            return np.full(len(tr), allowed[0])
+
+        zvals = tr[z_col].to_numpy(dtype=float)
+        nearest, off = SpatialDataHelpers._assign_points_to_slices(
+            zvals, allowed, SpatialDataHelpers._resolve_snap_z(self.sdata, None)
+        )
+        if off.any():
+            self.logger.info(
+                f"fov_{fov:0>4}: {int(off.sum())} transcripts do not land on a "
+                f"segmented z-slice."
+            )
+        return nearest
+
+    def get_cell_sizes(self, fov):
+        """`{cell_id: size}` for the FOV, size being the cell's voxel count.
+
+        Counted straight off the labels array, so it is the exact number of
+        voxels the segmentation gives the cell -- which is what `min_size` and
+        `max_size` are compared against.
+        """
+        counts = np.bincount(np.asarray(self.get_mask(fov)).ravel())
+        # mask value m -> cell id m-1; 0 is background
+        return {m - 1: int(counts[m]) for m in range(1, len(counts)) if counts[m]}
+
+    def get_cell_centroids(self, fov):
+        """`{cell_id: (x, y, z)}` for the FOV, in the "global" coordinate system.
+
+        Delegates to `spatialdata.get_centroids`, which computes the exact
+        voxel-weighted centre of each label -- across z for a 3D mask -- and maps
+        it through the element's transform, so the FOV's offset within the
+        experiment and any encoded pixel size are already applied. Coordinates
+        follow spatialdata's raster convention, where voxel `i` is centred at
+        `i + 0.5`.
+        """
+        centroids = get_centroids(self.get_labels(fov), coordinate_system="global")
+        if hasattr(centroids, "compute"):
+            centroids = centroids.compute()
+
+        axes = [ax for ax in ("x", "y", "z") if ax in centroids.columns]
+        out = {}
+        for label, row in centroids.iterrows():
+            point = [float(row[ax]) for ax in axes]
+            while len(point) < 3:  # a 2D mask has no z
+                point.append(0.0)
+            out[int(label) - 1] = tuple(point)
+        return out
+
+    def _size_excluded_cells(self, fov, min_size=None, max_size=None):
+        """Cell ids whose mask falls outside the requested size range."""
+        if min_size is None and max_size is None:
+            return set()
+        return {
+            cell_id
+            for cell_id, n in self.get_cell_sizes(fov).items()
+            if (min_size is not None and n < min_size)
+            or (max_size is not None and n > max_size)
+        }
+
+    def _border_cell_ids(self, fov):
+        """Cell ids whose mask touches the edge of the FOV on any z-slice.
+
+        These cells are cut off by the FOV boundary, so any centroid or size
+        measured here would only describe their visible fragment. A cell is
+        counted as touching if its label appears anywhere on the edge row or
+        column of any slice.
+        """
+        stack = self.get_mask(fov)
+        if stack.ndim == 2:
+            stack = stack[None, ...]
+        touching = set()
+        for plane in stack:
+            touching.update(np.unique(plane[0, :]))
+            touching.update(np.unique(plane[-1, :]))
+            touching.update(np.unique(plane[:, 0]))
+            touching.update(np.unique(plane[:, -1]))
+        touching.discard(0)
+        return {int(m) - 1 for m in touching}
+
+    def get_cell_shapes(self, fov, min_size=None, max_size=None):
+        """The FOV's cells as polygons, aggregated across the z axis.
+
+        A 3D segmentation is held in the SpatialData as one 2D shapes element
+        per z-slice (geopandas has no 3D polygons), so this reunites the slices
+        of each cell:
+
+            {cell_id: {z_index: shapely geometry}}
+
+        Existing `f"{fov}_z{z}_shapes"` elements are reused; if the FOV has none,
+        they are contoured on the fly with
+        `SpatialDataHelpers.masks_to_shapes` (without modifying `sdata`).
+
+        Coordinates: the polygons are in the FOV's own pixel space, the same
+        space the transcripts' `x`/`y` are in. A contour traced from the labels
+        array comes out in mask-array indices, while a transcript at `(x, y)`
+        sits at mask pixel `[y - 1, x - 1]`; `masks_to_shapes` closes that
+        one-pixel gap by shifting every vertex by its `polygon_offset` (1.0 by
+        default), so a transcript can be tested against a polygon directly, with
+        no correction of its own. Placing the polygons in the experiment-wide
+        frame instead is the job of the FOV's `"global"` transform
+        (`get_fov_affine`), which is not applied here.
+
+        Cell ids follow the SoftSeg convention `cell_id = mask_value - 1`.
+        Cells outside the `min_size`/`max_size` voxel-count range are omitted.
+        """
+        source = self.sdata
+        try:
+            # reuse the shapes already in the object rather than re-contouring
+            slices = SpatialDataHelpers._discover_zslice_shapes(source, fov)
+            self.logger.debug(
+                f"fov_{fov:0>4}: reusing {len(slices)} existing z-slice shapes."
+            )
+        except KeyError:
+            self.logger.info(
+                f"fov_{fov:0>4}: no z-slice shapes in the SpatialData, "
+                f"contouring {self._labels_key(fov)}."
+            )
+            source = SpatialDataHelpers.masks_to_shapes(
+                self.sdata,
+                labels_keys=[self._labels_key(fov)],
+                pool_size=1,
+                inplace=False,
+            )
+            slices = SpatialDataHelpers._discover_zslice_shapes(source, fov)
+
+        excluded = self._size_excluded_cells(fov, min_size, max_size)
+
+        by_cell = {}
+        for z, name in slices.items():
+            gdf = source.shapes[name]
+            for cell_id, geom in zip(gdf["cell_id"], gdf.geometry):
+                cell_id = int(cell_id)
+                if cell_id in excluded or geom is None or geom.is_empty:
+                    continue
+                by_cell.setdefault(cell_id, {})[int(z)] = geom
+        return by_cell
+
     def get_all_fovs(self):
         """Returns a list of all valid fov indicies for this object."""
-        ims = glob.glob(self.im_loc.format("****"))
-        ims = [parse.parse(self.im_loc, im)[0] for im in ims]
+        labels = {self._fov_of(k, "_labels") for k in self.sdata.labels}
+        points = {self._fov_of(k, "_points") for k in self.sdata.points}
+        return sorted(labels & points, key=str)
 
-        trs = glob.glob(self.csv_loc.format("****"))
-        trs = [parse.parse(self.csv_loc, tr)[0] for tr in trs]
+    def get_complete_fovs(self, column="cell_ids"):
+        """Returns a list of all fov indicies this object has already run on.
 
-        return list(set(ims).intersection(trs))
+        A FOV counts as complete once its transcript table carries `column`.
+        """
+        return [f for f in self.get_all_fovs() if self.has_column(f, column)]
 
-    def get_complete_fovs(self):
-        """Returns a list of all fov indicies that have output files from this object."""
-        compl = glob.glob(self.complete_csv_name.format("****"))
-        compl = [parse.parse(self.complete_csv_name, comp)[0] for comp in compl]
-
-        return compl
-
-    def get_incomplete_fovs(self):
+    def get_incomplete_fovs(self, column="cell_ids"):
         """Returns a list of all fov indicies that still need to be run by this object."""
-        all_fovs = self.get_all_fovs()
-        compl = self.get_complete_fovs()
-
-        return list(set(all_fovs) - set(compl))
+        return [f for f in self.get_all_fovs() if not self.has_column(f, column)]
 
     def random_complete_fov(self):
         fovs = self.get_complete_fovs()
@@ -172,8 +504,8 @@ class SoftAssigner:
         Yields random cell ids from cells that have transcripts mapped to them.
         """
 
-        im = skimage.io.imread(self.im_loc.format(fov))
-        tr = pd.read_csv(self.complete_csv_name.format(fov))
+        im = self.get_mask(fov)
+        tr = self.get_transcripts(fov)
 
         # strip out all possible cell ids from tr
         eligible = set()
@@ -213,7 +545,7 @@ class SoftAssigner:
 
         results = {}
         for f in self.get_complete_fovs():
-            trs = pd.read_csv(self.complete_csv_name.format(f))
+            trs = self.get_transcripts(f)
             for i, row in trs.iterrows():
                 for c, v in ast.literal_eval(row["cell_ids"]).items():
                     if int(c) in cell_ids:
@@ -223,15 +555,34 @@ class SoftAssigner:
                         cell_ids.remove(c)
         return results
 
-    def plot_completed_cell(self, fov, cells, gene_col_name="gene", dist_between_slices=None, tr_hi=None):
+    def plot_completed_cell(
+        self,
+        fov,
+        cells,
+        gene_col_name="gene",
+        dist_between_slices=None,
+        project_neighbor_slices=True,
+        tr_hi=None,
+    ):
         """
+        dist_between_slices: spacing between z-slices used when projecting a
+           cell's contour onto a neighbouring slice. If None (default) it is read
+           off the sdata's coordinate system; pass `project_neighbor_slices=False`
+           to switch the projection off entirely.
+
         tr_hi formatting:
         OPTIONAL dict key: color to use, values are dicts below:
         dict key: column to compare to transcript dataframe
            value: single value to match against OR list of values
         """
-        im = skimage.io.imread(self.im_loc.format(fov))
-        tr = pd.read_csv(self.complete_csv_name.format(fov))
+        im = self.get_mask(fov)
+        if im.ndim == 2:  # treat a flat mask as a single-slice stack
+            im = im[None, ...]
+        if dist_between_slices is None and project_neighbor_slices:
+            dist_between_slices = self.get_dist_between_slices(fov)
+        if not project_neighbor_slices:
+            dist_between_slices = None
+        tr = self.get_transcripts(fov)
 
         # collect relevant transcripts
         sel_tr = []
@@ -298,21 +649,21 @@ class SoftAssigner:
                     if not c_valid[i]:
                         if z > 0:
                             # check z-1
-                            if len(np.unique(im8[c][z - 1, :, :])) == 2:
+                            if len(np.unique(im8[i][z - 1, :, :])) == 2:
                                 c_neighbor[i] = True
                                 c_valid[i] = True
                                 cnt[i] = cv2.findContours(
-                                    im8[c][z - 1, :, :],
+                                    im8[i][z - 1, :, :],
                                     cv2.RETR_LIST,
                                     cv2.CHAIN_APPROX_SIMPLE,
                                 )[0]
-                        if z < np.shape(im8[c])[0] - 1:
+                        if z < np.shape(im8[i])[0] - 1:
                             # check z+1
-                            if len(np.unique(im8[c][z + 1, :, :])) == 2:
+                            if len(np.unique(im8[i][z + 1, :, :])) == 2:
                                 c_neighbor[i] = True
                                 c_valid[i] = True
                                 cnt[i] = cv2.findContours(
-                                    im8[c][z + 1, :, :],
+                                    im8[i][z + 1, :, :],
                                     cv2.RETR_LIST,
                                     cv2.CHAIN_APPROX_SIMPLE,
                                 )[0]
@@ -410,31 +761,95 @@ class SoftAssigner:
         del im
         del tr
 
+    def _blur_one_shape(
+        self,
+        cell_id,
+        geom,
+        rows,
+        x,
+        y,
+        cell_ids,
+        max_dist,
+        projected_dist=None,
+    ):
+        """Score one cell's polygon against the transcripts on its z-slice.
+
+        rows: indices into x/y/cell_ids of the transcripts sitting on this slice.
+        projected_dist: if not None, this polygon comes from a *neighbouring*
+           z-slice and every distance is lengthened by this out-of-plane offset.
+
+        Transcripts further than max_dist outside the polygon are left alone;
+        the rest get `{cell_id: decay_func(signed distance)}` merged into their
+        entry of cell_ids.
+        """
+        if len(rows) == 0:
+            return
+
+        # Only transcripts inside the polygon's bounding box (grown by max_dist)
+        # can possibly be within max_dist of it. Projecting onto a neighbouring
+        # slice only ever lengthens a distance, so this stays conservative.
+        minx, miny, maxx, maxy = geom.bounds
+        xs, ys = x[rows], y[rows]
+        near = (
+            (xs >= minx - max_dist)
+            & (xs <= maxx + max_dist)
+            & (ys >= miny - max_dist)
+            & (ys <= maxy + max_dist)
+        )
+        rows = rows[near]
+        if len(rows) == 0:
+            return
+
+        dist = signed_distance(geom, x[rows], y[rows])
+
+        if projected_dist is not None:
+            # the transcript is one slice away from the contour, so its true
+            # separation is the hypotenuse of (in-plane distance, slice spacing).
+            # A transcript inside the projected contour is simply the slice
+            # spacing away from it.
+            hypot = -1 * np.sqrt(dist**2 + projected_dist**2)
+            dist = np.where(dist < 0, hypot, np.maximum(hypot, -1 * projected_dist))
+
+        keep = dist > -1 * max_dist
+        name = str(cell_id)
+        for j, d in zip(rows[keep], dist[keep]):
+            # plain floats, so the dicts stay round-trippable through
+            # str() -> ast.literal_eval() when the table is written out
+            cell_ids[j][name] = float(self.decay_func(float(d)))
+
     def blur_fov(
-        self, f, min_size, max_dist, dist_between_slices=None, disable_tqdm=False
+        self,
+        f,
+        min_size,
+        max_dist,
+        dist_between_slices=None,
+        project_neighbor_slices=True,
+        disable_tqdm=False,
     ):
         """Run the first step of soft-segmentation, where masks are blurred and
-        multiple float values assigned to each transcript, corresponding to which
-        cells they may be members of and their relative likelihoods.
+                multiple float values assigned to each transcript, corresponding to which
+                cells they may be members of and their relative likelihoods.
 
-        f: fov number
-        min_size: minimum size for eligible masks.
-        max_dist: the maximum distance between a transcript and a mask to be considered eligible.
-        dist_between_slices: if provided and the images are 3d, slices with no contours
-         within 1 zslice of a slice with a valid contour will project that contour with
-         this added distance
+                Both the segmentation and the transcripts come from the bound SpatialData
+                object. A 3D segmentation is handled through
+                `SpatialDataHelpers.masks_to_shapes`, which splits the mask into one
+                polygon set per z-slice; `get_cell_shapes` reunites those slices per cell,
+                and each transcript is matched to its slice with the same rule
+                `SpatialDataHelpers.aggregate_zslice_shapes` uses.
 
-        writes to disk: self.complete_csv_name.format(f)
-        returns: (tr, intensities)
-         tr: dataframe of transcript information
-         intensities: list of all assigned intensity values
+                f: fov number
+                min_size: minimum size for eligible masks, in voxels.
+                max_dist: the maximum distance between a transcript and a mask to be considered eligible.
+                dist_between_slices: for 3d data, slices with no contours within 1 zslice
+                 of a slice with a valid contour will project that contour with this added
+                 distance. If None (default), the spacing is read off the sdata's
+                 coordinate system (`get_dist_between_slices`).
+                project_neighbor_slices: set False to disable that projection entirely.
+
+        writes: the `cell_ids` column of the FOV's points element, saved to the store
+                returns: dataframe of transcript information (None during a pooled run)
         """
-        im = skimage.io.imread(self.im_loc.format(f))
-        # filter this before we do anything else to save time...
-        im = size_filter(im, min_size=min_size)
-
-        tr = pd.read_csv(self.csv_loc.format(f), index_col=0)
-        tr = tr.reset_index()
+        tr = self.get_transcripts(f)
 
         if len(tr) > 0:
             self.logger.info(f"[{datetime.now()}] starting fov_{f:0>4}...")
@@ -443,134 +858,89 @@ class SoftAssigner:
             if "cell_ids" in tr.keys():
                 tr.drop(["cell_ids"], axis=1, inplace=True)
 
-            # add empty column that we're about to populate'
-            tr["cell_ids"] = [{} for _ in range(len(tr))]
+            # the spacing between z-slices lives in the sdata's coordinate
+            # system, so read it from there unless we were handed one
+            if self.is_3d(f) and project_neighbor_slices:
+                if dist_between_slices is None:
+                    dist_between_slices = self.get_dist_between_slices(f)
+            else:
+                dist_between_slices = None
 
-            if len(np.shape(im)) > 2:
-                elig_z = [plane for plane in range(np.shape(im)[0])]
-                # going to assume that the z-axis is the 0th
+            # slices in the segmentation may not line up with the transcripts'
+            # z values, so resolve each transcript to a slice up front
+            elig_z = self.valid_slices(f)
+            slice_of_tr = self.transcript_slices(f, tr)
+            tr_by_slice = {z: np.flatnonzero(slice_of_tr == z) for z in elig_z}
 
-            if "global_z" in tr.columns:
-                z_global = list(tr["global_z"])
-            x = list(tr["x"])
-            y = list(tr["y"])
-            cell_ids = list(tr["cell_ids"])
+            x = tr["x"].to_numpy(dtype=float)
+            y = tr["y"].to_numpy(dtype=float)
+            cell_ids = [{} for _ in range(len(tr))]
 
-            all_masks = np.unique(im)
+            # each cell as {z: polygon}, i.e. its 2D slices aggregated back
+            # together along the z axis
+            shapes_by_cell = self.get_cell_shapes(f, min_size=min_size)
+
             if not disable_tqdm:
-                pbar = tqdm(total=len(all_masks))
+                pbar = tqdm(total=len(shapes_by_cell))
 
-            for m in all_masks:
-                if m == 0:  # background, not a cell
-                    if not disable_tqdm:
-                        pbar.update(1)
-                    continue
-                temp_im = (im == m).astype(np.uint8)
+            # ascending cell id, so each transcript's dict of candidates is
+            # ordered by cell id -- `assign_to_cell` returns the first key that
+            # clears its thresholds, so the order is part of the result
+            for cell_id in sorted(shapes_by_cell):
+                by_z = shapes_by_cell[cell_id]
 
-                if len(np.shape(im)) == 2:  # two dimensional
-                    cnt, _ = cv2.findContours(
-                        temp_im, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
-                    )
-                    if len(cnt) > 1:
-                        self.logger.info(
-                            f"WARNING! Cell ID {m-1} has {len(cnt)} total contours, only using the first."
-                        )
-                    elif len(cnt) == 0:
-                        self.logger.info(
-                            f"WARNING! Cell ID {m-1} has no eligible contours. Skipping cell ID {m-1}."
+                for z in elig_z:
+                    rows = tr_by_slice[z]
+                    if len(rows) == 0:
+                        continue
+
+                    geom = by_z.get(z)
+                    if geom is not None:
+                        self._blur_one_shape(
+                            cell_id, geom, rows, x, y, cell_ids, max_dist
                         )
                         continue
 
-                    for j in range(len(tr)):
-                        dist = cv2.pointPolygonTest(
-                            cnt[0],
-                            (x[j] - 1, y[j] - 1),
-                            True,
+                    if dist_between_slices is None:
+                        continue
+
+                    # no contour on this slice: borrow a neighbouring one.
+                    # Realistically we should not have a case where there are two
+                    # neighboring slices that both have contours surrounding a
+                    # slice with no contours. So just do basic check.
+                    neighbor = z - 1 if (z - 1) in by_z else (z + 1)
+                    if neighbor not in by_z:
+                        self.logger.debug(
+                            f"Cell ID {cell_id} zslice {z} has no eligible neighbors. Skipping zslice {z}."
                         )
-                        if dist > -1 * max_dist:
-                            cell_ids[j] = dict(
-                                cell_ids[j], **{str(m - 1): self.decay_func(dist)}
-                            )
-                else:  # three dimensional (presumably)
-                    # slices in image may not line up with data...
-                    cntz = {}
-                    cntz_best_neighbor = {}
-                    for z in elig_z:
-                        cnt, _ = cv2.findContours(
-                            temp_im[z], cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
-                        )
-                        if len(cnt) > 1:
-                            self.logger.info(
-                                f"WARNING! Cell ID {m-1} zslice {z} has {len(cnt)} total contours, only using the first."
-                            )
-                        elif len(cnt) == 0:
-                            self.logger.info(
-                                f"WARNING! Cell ID {m-1} zslice {z} has no eligible contours. Skipping zslice {z} for now."
-                            )
-                            if dist_between_slices is not None:
-                                cntz_best_neighbor[z] = None
-                            continue
+                        continue
+                    self.logger.debug(
+                        f"Assigning cell ID {cell_id} zslice {z} nearest neighbor as {neighbor}."
+                    )
+                    self._blur_one_shape(
+                        cell_id,
+                        by_z[neighbor],
+                        rows,
+                        x,
+                        y,
+                        cell_ids,
+                        max_dist,
+                        projected_dist=dist_between_slices,
+                    )
 
-                        cntz[z] = cnt[0]
-
-                    if dist_between_slices is not None:
-                        for z in list(cntz_best_neighbor.keys()):
-                            # realistically we should not have a case where there are two neighboring slices
-                            # that both have contours surrounding a slice with no contours. So just do basic check.
-                            if z - 1 in cntz.keys():
-                                cntz_best_neighbor[z] = cntz[z - 1]
-                                self.logger.info(
-                                    f"Assigning cell ID {m-1} zslice {z} nearest neighbor as {z-1}."
-                                )
-                            elif z + 1 in cntz.keys():
-                                cntz_best_neighbor[z] = cntz[z + 1]
-                                self.logger.info(
-                                    f"Assigning cell ID {m-1} zslice {z} nearest neighbor as {z+1}."
-                                )
-                            else:
-                                del cntz_best_neighbor[z]
-                                self.logger.info(
-                                    f"WARNING! Cell ID {m-1} zslice {z} has no eligible neighbors. Skipping zslice {z}."
-                                )
-
-                    for j in range(len(tr)):
-                        if z_global[j] in elig_z:
-                            dist = None
-                            if z_global[j] in cntz.keys():
-                                dist = cv2.pointPolygonTest(
-                                    cntz[z_global[j]],
-                                    (x[j] - 1, y[j] - 1),
-                                    True,
-                                )
-                            elif z_global[j] in cntz_best_neighbor.keys():
-                                dist = cv2.pointPolygonTest(
-                                    cntz_best_neighbor[z_global[j]],
-                                    (x[j] - 1, y[j] - 1),
-                                    True,
-                                )
-                                if dist < 0:
-                                    dist = -1 * np.sqrt(
-                                        dist**2 + dist_between_slices**2
-                                    )
-                                else:
-                                    dist = max(
-                                        -1 * np.sqrt(dist**2 + dist_between_slices**2),
-                                        dist_between_slices * -1,
-                                    )
-
-                            if dist is not None and dist > -1 * max_dist:
-                                cell_ids[j] = dict(
-                                    cell_ids[j], **{str(m - 1): self.decay_func(dist)}
-                                )
                 if not disable_tqdm:
                     pbar.update(1)
-            del im
+
+            del shapes_by_cell
 
             if not disable_tqdm:
                 pbar.close()
 
-            tr["cell_ids"] = cell_ids
-            tr.to_csv(self.complete_csv_name.format(f), index=False)
+            # parquet has no type for a python dict, so the per-transcript
+            # {cell_id: score} maps are stored as their str() repr and read back
+            # with ast.literal_eval
+            tr["cell_ids"] = [str(d) for d in cell_ids]
+            self.set_transcripts(f, tr)
 
             self.logger.info(
                 f"[{datetime.now()}] saved fov_{f:0>4}\n\t{len(tr)} transcripts"
@@ -603,7 +973,12 @@ class SoftAssigner:
             return None
 
     def blur_all_fovs(
-        self, min_size, max_dist, dist_between_slices=None, sel_fovs=None
+        self,
+        min_size,
+        max_dist,
+        dist_between_slices=None,
+        project_neighbor_slices=True,
+        sel_fovs=None,
     ):
         """Run the first step of soft-segmentation, where masks are blurred and
         multiple float values assigned to each transcript, corresponding to which
@@ -614,40 +989,61 @@ class SoftAssigner:
         pool_size: the number of threads to be used.
         min_size: minimum size for eligible masks.
         max_dist: the maximum distance between a transcript and a mask to be considered eligible.
+        dist_between_slices: as in blur_fov; read per-FOV off the sdata's
+            coordinate system when left as None.
 
-        writes to disk: self.complete_csv_name.format(f) for all FOVs.
+        writes: the `cell_ids` column of every FOV's points element, saved to the store.
         """
         if sel_fovs is None:
             sel_fovs = self.get_incomplete_fovs()
 
-        with tqdm(total=len(sel_fovs)) as pbar:
-            with closing(Pool(self.pool_size)) as pool:
-                results = pool.imap_unordered(
-                    self.__func_wrapper__,
-                    zip(
-                        repeat(self.blur_fov),
-                        sel_fovs,
-                        repeat(min_size),
-                        repeat(max_dist),
-                        repeat(dist_between_slices),
-                        repeat(True),
-                    ),
-                )
-                for result in results:
-                    pbar.update(1)
+        self._run_over_fovs(
+            zip(
+                repeat(SoftAssigner.blur_fov),
+                sel_fovs,
+                repeat(min_size),
+                repeat(max_dist),
+                repeat(dist_between_slices),
+                repeat(project_neighbor_slices),
+                repeat(True),
+            ),
+            len(sel_fovs),
+            self.pool_size,
+        )
 
-    def combine_soft_csvs(self):
-        """Combines all soft-assignment csvs into one master file."""
-        full_tr = None
-        for f in self.get_complete_fovs():
-            tr = pd.read_csv(self.complete_csv_name.format(f))
-            if full_tr is None:
-                full_tr = tr
-            else:
-                full_tr = pd.concat([full_tr, tr])
+    def combine_soft_transcripts(self, sel_fovs=None):
+        """Every FOV's soft-assignment table, concatenated into one dataframe.
 
-        full_tr.to_csv(f"{self.complete_loc}all_soft_cellids.csv", index=False)
+        Also records the total transcript count on the instance, which
+        `calculate_confident_threshold` uses to size its working arrays.
+        """
+        if sel_fovs is None:
+            sel_fovs = self.get_complete_fovs()
+
+        full_tr = pd.concat(
+            [self.get_transcripts(f) for f in sel_fovs], ignore_index=True
+        )
         self.num_transcripts = len(full_tr)
+        return full_tr
+
+    def count_transcripts(self, sel_fovs=None):
+        """Record the total number of transcripts across the given FOVs.
+
+        Reads each FOV's row count rather than materialising the tables, so it
+        is the cheap way to set `num_transcripts` when the concatenated table
+        from `combine_soft_transcripts` is not itself needed.
+        """
+        if sel_fovs is None:
+            sel_fovs = self.get_complete_fovs()
+
+        total = 0
+        for f in sel_fovs:
+            el = self.sdata.points[self._points_key(f)]
+            total += int(
+                el.shape[0].compute() if hasattr(el.shape[0], "compute") else len(el)
+            )
+        self.num_transcripts = total
+        return total
 
     def assign_to_cell(self, assigned, min_thresh=None):
         """
@@ -663,7 +1059,9 @@ class SoftAssigner:
         if total == 0:
             return None
         for k, v in assigned.items():
-            if (min_thresh is None or float(v) / total > min_thresh) and float(v) >= 0.5:
+            if (min_thresh is None or float(v) / total > min_thresh) and float(
+                v
+            ) >= 0.5:
                 return k
         return None
 
@@ -693,7 +1091,7 @@ class SoftAssigner:
 
         for f in sel_fovs:
             self.logger.info(f"Reading in fov {f}\t{datetime.now()}")
-            tr = pd.read_csv(self.complete_csv_name.format(f))
+            tr = self.get_transcripts(f)
             for r, row in tr.iterrows():
                 assigned = ast.literal_eval(row["cell_ids"])
                 ind = 0
@@ -838,30 +1236,29 @@ class SoftAssigner:
         gene_col_name="gene",
         min_thresh=None,
         assigned_col=None,
-        fov_locs=None,
-        prev_adata=None,
         sel_fovs=None,
+        table_name=None,
     ):
         """
         Converts all completed analyses to adata format.
 
-        There are two different ways that two aspects of this can be run.
+        The result is stored as a table in the sdata (and saved to the store)
+        under `table_name`, defaulting to "cxg", or
+        "cxg_resegmented_{assigned_col}" when reading from an assignment column.
 
         When determining what transcripts go into what cells:
         - If assigned_col is provided, will pull the cell id from that column.
         - Otherwise, self.assign_to_cell will be passed the "cell_ids" column.
           If min_thresh is provided, that will be passed on to that method.
 
-        When labelling cells with location metadata:
-        - If prev_adata is provided, all columns from adata.obs that do not contain the
-          word "coun" will be transferred to the cell with the same id in the new adata.
-        - If fov_locs is provided, images will be loaded in and cell centroids will be
-          calculated from contours in that image.
-        Note that one of these two variables MUST be provided.
+        Each cell is then labelled with its size and centroid, measured from the
+        segmentation in the sdata: the cell's polygons are taken slice by slice
+        and aggregated along the z axis, area-weighted, then mapped through the
+        FOV's "global" transform. `size` is the summed polygon area in pixels;
+        `x_coords`/`y_coords`/`z_coords` are in the units of the sdata's "global"
+        coordinate system, which carries both the FOV's offset within the
+        experiment and the physical pixel size, if one was encoded.
         """
-
-        if fov_locs is None and prev_adata is None:
-            raise ValueError("One of fov_locs or prev_adata must be provided.")
 
         cxg_dict = {}
         if sel_fovs is None:
@@ -869,7 +1266,7 @@ class SoftAssigner:
 
         print("Reading cell by gene data from transcript tables.")
         for f in tqdm(sel_fovs):
-            tr = pd.read_csv(self.complete_csv_name.format(f))
+            tr = self.get_transcripts(f)
             self.logger.info(f"[{datetime.now()}] started reading in fov_{f:0>4}.")
 
             if assigned_col is not None:
@@ -903,109 +1300,62 @@ class SoftAssigner:
             self.logger.info(f"[{datetime.now()}] completed reading in fov_{f:0>4}.")
 
         cxg_df = pd.DataFrame.from_dict(cxg_dict, orient="index")
+        # genes and cells otherwise come out in whatever order the transcript
+        # tables happened to mention them first, which makes the var/obs order
+        # depend on row order rather than on the data
+        cxg_df = cxg_df.reindex(sorted(cxg_df.columns), axis=1).sort_index()
 
         adata = ad.AnnData(cxg_df)
 
-        if prev_adata is not None:
-            col_oi = [col for col in prev_adata.obs.columns if "count" not in col]
-            sel_cells = []
-            for cell in tqdm(adata.obs.index.to_list()):
-                if cell in prev_adata.obs.index:
-                    sel_cells.append(cell)
+        adata.obs["fov"] = pd.Series(
+            [None] * len(adata), index=adata.obs.index, dtype=object
+        )
+        adata.obs["size"] = pd.DataFrame(np.zeros((len(adata), 1)))
+        adata.obs["x_coords"] = pd.DataFrame(np.zeros((len(adata), 1)))
+        adata.obs["y_coords"] = pd.DataFrame(np.zeros((len(adata), 1)))
+        adata.obs["z_coords"] = pd.DataFrame(np.zeros((len(adata), 1)))
 
-            adata = adata[[cell in sel_cells for cell in adata.obs.index]]
-            for col in col_oi:
-                adata.obs[col] = pd.DataFrame(np.zeros((len(adata), 1)))
-                adata.obs.loc[sel_cells, col] = prev_adata.obs.loc[sel_cells, col]
-        else:
-            adata.obs["fov"] = pd.DataFrame(np.zeros((len(adata), 1)))
-            adata.obs["size"] = pd.DataFrame(np.zeros((len(adata), 1)))
-            adata.obs["x_coords"] = pd.DataFrame(np.zeros((len(adata), 1)))
-            adata.obs["y_coords"] = pd.DataFrame(np.zeros((len(adata), 1)))
-            adata.obs["z_coords"] = pd.DataFrame(np.zeros((len(adata), 1)))
+        with pd.option_context("display.max_seq_items", None):
+            self.logger.debug(f"All valid cell ids: {adata.obs_names}")
 
-            with pd.option_context("display.max_seq_items", None):
-                self.logger.debug(f"All valid cell ids: {adata.obs_names}")
+        print("Finding cell centroid data and copying to anndata object")
+        for f in tqdm(sel_fovs):
+            if self._labels_key(f) not in self.sdata.labels:
+                self.logger.info(f"[{datetime.now()}] skipped converting fov_{f:0>4}.")
+                continue
 
-            print("Finding cell centroid data and copying to anndata object")
-            for f in tqdm(sel_fovs):
-                if Path(self.im_loc.format(f)).is_file():
-                    im = skimage.io.imread(self.im_loc.format(f))
-                    im = remove_border(im)
-                    with Pool(self.pool_size) as pool:
-                        results = pool.starmap(
-                            getContour, zip(repeat(im), np.unique(im))
-                        )
-                    # THIS is where we account for the fact that image IDs are 1-indexed
-                    all_contours = {
-                        cs[1] - 1: cs[0] for cs in results if cs is not None
-                    }
+            sizes = self.get_cell_sizes(f)
+            centroids = self.get_cell_centroids(f)
+            # cells clipped by the FOV edge are only partly visible here, so
+            # leave them to the FOV that holds the whole cell
+            border = self._border_cell_ids(f)
 
-                    for k, v in all_contours.items():
-                        if k == -1 or str(k) not in adata.obs_names:  # don't run on bg
-                            self.logger.debug(
-                                f"[{datetime.now()}] cell id {k} not valid."
-                            )
-                            continue
-                        moments = []
-                        for n in range(len(v)):
-                            if len(v[n]) > 0:
-                                moments.append(cv2.moments(v[n][0]))
-                            else:
-                                moments.append({"m00": 0, "m01": 0, "m10": 0})
+            for k, size in sizes.items():
+                if k in border or str(k) not in adata.obs_names:
+                    self.logger.debug(f"[{datetime.now()}] cell id {k} not valid.")
+                    continue
 
-                        total_size = sum([n["m00"] for n in moments])
+                sel = adata.obs.index.isin([str(k)])
+                adata.obs.loc[sel, "fov"] = f
+                adata.obs.loc[sel, "size"] = size
 
-                        adata.obs.loc[adata.obs.index.isin([str(k)]), "fov"] = f
-                        adata.obs.loc[adata.obs.index.isin([str(k)]), "size"] = (
-                            total_size
-                        )
-                        if total_size != 0:
-                            adata.obs.loc[
-                                adata.obs.index.isin([str(k)]), "x_coords"
-                            ] = (
-                                int(sum([n["m10"] for n in moments]) / total_size)
-                                + fov_locs[f]["x"][0]
-                            )
-                            adata.obs.loc[
-                                adata.obs.index.isin([str(k)]), "y_coords"
-                            ] = (
-                                int(sum([n["m01"] for n in moments]) / total_size)
-                                + fov_locs[f]["y"][0]
-                            )
-                            adata.obs.loc[
-                                adata.obs.index.isin([str(k)]), "z_coords"
-                            ] = (
-                                sum(
-                                    [
-                                        moments[ln]["m00"] * ln
-                                        for ln in range(len(moments))
-                                    ]
-                                )
-                                / total_size
-                            )
-                        # print(adata[str(k)].obs)
-                        del moments
-                    del all_contours
-                    del im
-                    self.logger.info(
-                        f"[{datetime.now()}] completed converting fov_{f:0>4}."
-                    )
-                else:
-                    self.logger.info(
-                        f"[{datetime.now()}] skipped converting fov_{f:0>4}."
-                    )
+                centroid = centroids.get(k)
+                if centroid is not None:
+                    adata.obs.loc[sel, "x_coords"] = centroid[0]
+                    adata.obs.loc[sel, "y_coords"] = centroid[1]
+                    adata.obs.loc[sel, "z_coords"] = centroid[2]
+
+            self.logger.info(f"[{datetime.now()}] completed converting fov_{f:0>4}.")
 
         adata.X = np.nan_to_num(adata.X)
 
-        dat = datetime.today().strftime("%Y%m%d_%H%M")
-        filename = f"{self.complete_loc}cxg_adata_{dat}"
-        if assigned_col is not None:
-            filename += f"_resegmented_{assigned_col}"
-        filename += ".h5ad"
+        if table_name is None:
+            table_name = "cxg"
+            if assigned_col is not None:
+                table_name += f"_resegmented_{assigned_col}"
 
-        adata.write(filename)
-        print(f"Saved {filename}")
+        self.save_table(table_name, adata)
+        print(f"Saved table {table_name!r}")
         return adata
 
     def get_scoring_matrix(self, adata, cats, normed=True):
@@ -1279,12 +1629,15 @@ class SoftAssigner:
             its own pbar entities.
         overwrite (bool): if True, this method will overwite assigned_col if it already exists.
         """
-        tr = pd.read_csv(self.complete_csv_name.format(f), index_col=0)
-        if assigned_col in tr.columns and not overwrite:
+        if self.has_column(f, assigned_col) and not overwrite:
             self.logger.info(
                 f"[{datetime.now()}] skipping fov_{f:0>4}, {assigned_col} already present"
             )
             return
+
+        # transcript id is the row label here: the scoring below addresses
+        # transcripts by it, and it is restored to a column before saving
+        tr = self.get_transcripts(f).set_index("index")
 
         self.logger.info(
             f"[{datetime.now()}] evaluate_overlapping_regions starting fov_{f:0>4}..."
@@ -1532,7 +1885,9 @@ class SoftAssigner:
                             )
 
                             if assignment is False:
-                                self.logger.error(f"CRITICAL PROBLEM.\nfov: {f}\nelg_cells: {elg_cells}\nunconf_tup: {unconf_tup}\ntr_by_cell: {tr_by_cell}")
+                                self.logger.error(
+                                    f"CRITICAL PROBLEM.\nfov: {f}\nelg_cells: {elg_cells}\nunconf_tup: {unconf_tup}\ntr_by_cell: {tr_by_cell}"
+                                )
                                 break
 
                             if use_conf_trs:
@@ -1607,14 +1962,10 @@ class SoftAssigner:
         if pbar is not None:
             pbar.close()
 
-        self.logger.info(
-            f"[{datetime.now()}] saving pydict and updating tr for fov_{f:0>4}"
-        )
+        self.logger.info(f"[{datetime.now()}] updating tr for fov_{f:0>4}")
 
-        # saving dict of transcripts that we have reassigned
-        dict_loc = f"{self.complete_loc}overlap_eval_{assigned_col}_fov_{f:0>4}.pydict"
-        with open(dict_loc, "w") as fl:
-            fl.write(str(assigned_trs))
+        # the reassignments themselves do not need saving separately: they are
+        # exactly what the assigned_col column below records, per transcript
 
         # below creates dict of {key: tr ID, value: cell ID}
         inv_assignment = {
@@ -1666,11 +2017,7 @@ class SoftAssigner:
             axis=1,
         )
 
-        # last bit of cleanup before we save it:
-        tr = tr.loc[:, ~tr.columns.str.contains("^Unnamed")]
-        tr.to_csv(self.complete_csv_name.format(f), sep=",")
-
-        # save deltas while we're here
+        # tally deltas while the table is still addressed by transcript id
         if save_delta_tallies:
             deltas = {}
             final_trs = {}
@@ -1701,11 +2048,19 @@ class SoftAssigner:
             for cell in list(set(final_trs.keys()) - set(deltas.keys())):
                 deltas[cell] = [0, 0, 0, len(final_trs[cell])]
 
-            dict_loc = (
-                f"{self.complete_loc}delta_tallies_{assigned_col}_fov_{f:0>4}.pydict"
+            # one table per FOV, so pooled workers each save their own element
+            cells = sorted(deltas)
+            tally = ad.AnnData(
+                np.array([deltas[c] for c in cells], dtype=float).reshape(len(cells), 4)
             )
-            with open(dict_loc, "w") as fl:
-                fl.write(str(assigned_trs))
+            tally.obs_names = [str(c) for c in cells]
+            tally.var_names = ["gained", "lost", "changed", "final"]
+            tally.obs["cell_id"] = cells
+            self.save_table(f"{f}_deltas_{assigned_col}", tally)
+
+        # last bit of cleanup before we save it:
+        tr = tr.loc[:, ~tr.columns.str.contains("^Unnamed")]
+        self.set_transcripts(f, tr.reset_index())
 
         # this is too big to keep in memory if we're a part of a pool
         # that's running everything. So, delete if we are in a pool.
@@ -1718,6 +2073,92 @@ class SoftAssigner:
         # needed to use imap; want to use imap to have tqdm progress bar
         # pass target function as first arg, the rest get passed through
         return args[0](*args[1:])
+
+    # Start methods to try, in order. "fork" is deliberately not among them: by
+    # the time a pool is created the parent has been reading (and often writing)
+    # the SpatialData's zarr store through dask, and a forked child inherits that
+    # machinery's locks without the threads that would release them -- the pool
+    # then hangs, which is exactly what happens if you convert a dataset and run
+    # blur_all_fovs in the same session.
+    _START_METHODS = ("forkserver", "spawn")
+
+    def _mp_context(self):
+        for method in self._START_METHODS:
+            try:
+                return multiprocessing.get_context(method)
+            except ValueError:  # not available on this platform
+                continue
+        return multiprocessing.get_context()
+
+    def _pool(self, processes):
+        """A worker pool whose processes are each bound to this assigner.
+
+        The assigner is handed over once, when a worker starts, instead of being
+        pickled alongside every task -- which matters now that it owns a whole
+        SpatialData. A zarr-backed object is not copied at all: __getstate__
+        drops it and each worker re-opens the store on first use.
+
+        Because the workers do not fork, the assigner has to be picklable: keep
+        `decay_func` a module-level function rather than a lambda if you plan to
+        run with `pool_size > 1`.
+        """
+        return self._mp_context().Pool(
+            processes=processes, initializer=_init_worker, initargs=(self,)
+        )
+
+    def _check_parallel_allowed(self):
+        """Raise unless this object can be worked on by several processes.
+
+        A worker returns its results by saving its own FOV's element back to the
+        store; with nowhere to save, the work would be done and then lost when
+        the process exits. There are two ways to be in that position, and they
+        need different fixes.
+        """
+        if self._sdata_path is None:
+            raise ValueError(
+                "This SpatialData has never been saved, so worker processes "
+                "would have nowhere to write their results and every FOV's "
+                "output would be lost. Save it first -- "
+                "`sdata.write('/path/to/store.zarr')`, or convert it with "
+                "`save_loc=` -- and build the SoftAssigner from the saved "
+                "object. To work in memory instead, set pool_size=1."
+            )
+        if not self.sdata.is_backed():
+            raise ValueError(
+                f"This SpatialData came from {self._sdata_path!r} but is not "
+                "currently backed by it, so worker processes could not save "
+                "their results. Re-open the store "
+                f"(`spatialdata.read_zarr({self._sdata_path!r})`) and build the "
+                "SoftAssigner from that object. To work in memory instead, set "
+                "pool_size=1."
+            )
+
+    def _run_over_fovs(self, tasks, total, processes):
+        """Run `(func, *args)` tasks, in a worker pool or serially, with a pbar.
+
+        `processes <= 1` skips multiprocessing entirely, which keeps single-
+        threaded runs usable from a plain script (a pool's workers do not fork,
+        so they re-import __main__ and need the usual
+        `if __name__ == "__main__":` guard around your script).
+
+        Workers pass their results back by saving their own FOV's element to the
+        store, so a parallel run requires one: see `_check_parallel_allowed`.
+        Afterwards the store is re-read, since the elements the workers rewrote
+        are newer than the ones held here.
+        """
+        if processes > 1:
+            self._check_parallel_allowed()
+
+        with tqdm(total=total) as pbar:
+            if processes <= 1:
+                for task in tasks:
+                    task[0](self, *task[1:])
+                    pbar.update(1)
+                return
+            with closing(self._pool(processes)) as pool:
+                for _ in pool.imap_unordered(_run_worker, tasks):
+                    pbar.update(1)
+        self._reload_sdata()
 
     def evaluate_all_overlapping_regions(
         self,
@@ -1754,63 +2195,65 @@ class SoftAssigner:
 
         self.logger.info(f"Pooling fovs for parallel processing, as:\n{fov_pool}")
 
-        with tqdm(total=len(sel_fovs)) as pbar:
-            for subset_fovs in fov_pool:
-                self.logger.info(f"[{datetime.now()}] starting sub-pool: {subset_fovs}")
-                pool_size = min(self.pool_size, len(subset_fovs))
-                with closing(Pool(processes=pool_size)) as pool:
-                    results = pool.imap_unordered(
-                        self.__func_wrapper__,
-                        zip(
-                            repeat(self.evaluate_overlapping_regions_single_fov),
-                            subset_fovs,
-                            repeat(gene_col_name),
-                            repeat(min_thresh),
-                            repeat(default_thresh),
-                            repeat(only_tagged_cells),
-                            repeat(use_conf_trs),
-                            repeat(use_other_cells),
-                            repeat(use_mse_score),
-                            repeat(assigned_col),
-                            repeat(omit_blanks),
-                            repeat(auto_assign_single_target),
-                            repeat(save_delta_tallies),
-                            repeat(True),
-                            repeat(overwrite),
-                        ),
-                    )
-                    for result in results:
-                        pbar.update(1)
+        for subset_fovs in fov_pool:
+            self.logger.info(f"[{datetime.now()}] starting sub-pool: {subset_fovs}")
+            self._run_over_fovs(
+                zip(
+                    repeat(SoftAssigner.evaluate_overlapping_regions_single_fov),
+                    subset_fovs,
+                    repeat(gene_col_name),
+                    repeat(min_thresh),
+                    repeat(default_thresh),
+                    repeat(only_tagged_cells),
+                    repeat(use_conf_trs),
+                    repeat(use_other_cells),
+                    repeat(use_mse_score),
+                    repeat(assigned_col),
+                    repeat(omit_blanks),
+                    repeat(auto_assign_single_target),
+                    repeat(save_delta_tallies),
+                    repeat(True),
+                    repeat(overwrite),
+                ),
+                len(subset_fovs),
+                min(self.pool_size, len(subset_fovs)),
+            )
 
-    def save_combined_changed_transcripts(self, assigned_col="assignment"):
-        sel_trs = None
+    def combined_changed_transcripts(
+        self, assigned_col="assignment", gene_col_name="gene"
+    ):
+        """Every transcript whose cell type changed under `assigned_col`.
+
+        Returns one dataframe covering all FOVs. This is a cross-FOV summary of
+        transcripts rather than of cells, so it is handed back rather than stored
+        as a table -- write it wherever you need it.
+        """
+        wanted = [
+            gene_col_name,
+            "og_cell",
+            "og_type",
+            assigned_col,
+            f"{assigned_col}_type",
+        ]
+
+        sel_trs = []
         for f in self.get_complete_fovs():
-            tr = pd.read_csv(self.complete_csv_name.format(f), index_col=0)
-            if assigned_col in tr:
-                # first filter to transcripts where the types are different (and not both null)
-                tr = tr.fillna("None")
-                tr = tr[
-                    (tr[f"{assigned_col}_type"] != tr["og_type"])
-                ]
+            tr = self.get_transcripts(f).set_index("index")
+            if any(col not in tr.columns for col in wanted):
+                continue
 
-                # now filter down to the columns we care about
-                tr = tr[
-                    [
-                        "gene",
-                        "fov",
-                        "og_cell",
-                        "og_type",
-                        assigned_col,
-                        f"{assigned_col}_type",
-                    ]
-                ]
+            # narrow first, and drop to plain objects on the way: the gene column
+            # comes back from parquet as a Categorical, which refuses fillna with
+            # a value outside its categories
+            tr = tr[wanted].astype(object).fillna("None")
 
-                if sel_trs is None:
-                    sel_trs = tr
-                else:
-                    sel_trs = pd.concat([sel_trs, tr])
-                    del tr
+            # keep transcripts whose type changed (and are not both null)
+            tr = tr[tr[f"{assigned_col}_type"] != tr["og_type"]]
 
-        dat = datetime.today().strftime("%Y%m%d_%H%M")
-        filename = f"{self.complete_loc}moved_trs_{dat}.csv"
-        sel_trs.to_csv(filename, sep=",")
+            # the FOV is implicit in which element the rows came from
+            tr.insert(1, "fov", f)
+            sel_trs.append(tr)
+
+        if not sel_trs:
+            return pd.DataFrame(columns=wanted[:1] + ["fov"] + wanted[1:])
+        return pd.concat(sel_trs)
