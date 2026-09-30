@@ -41,7 +41,7 @@ class CellTypeAssigner:
 
         The target cell-by-gene data comes either as `adata` directly, or as
         `table_name` naming a table in `sdata` -- which is where
-        `SoftAssigner.convert_to_adata` leaves its results. Passing `sdata` also
+        `SoftAssigner.generate_cxg_table` leaves its results. Passing `sdata` also
         lets `save_annotated_adata` put the annotated result back into the store.
         """
         self.ref_levels = ref_levels

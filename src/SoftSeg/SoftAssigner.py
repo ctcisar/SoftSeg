@@ -1,12 +1,14 @@
 import ast
+import json
 import logging
 import multiprocessing
 import random
+import warnings
 from collections import Counter
 from contextlib import closing
-from copy import deepcopy
 from datetime import datetime
 from itertools import repeat
+from collections.abc import Mapping
 from pathlib import Path
 
 import anndata as ad
@@ -47,22 +49,129 @@ def _run_worker(args):
     return func(_WORKER_ASSIGNER, *rest)
 
 
+# The scoring matrix's QC bounds have no default: what counts as too few
+# transcripts depends on the panel, so a number that suits one dataset throws
+# away most of another. They belong to the dataset, and are carried in its
+# attrs -- see `SoftAssigner.qc_bounds`. This marks an argument nobody passed,
+# which is not the same as one passed as None (that turns the filter off).
+UNSET = object()
+
+
+# How every per-transcript assignment column says "no cell here" -- see
+# `SoftAssigner.as_label_column` for why this spelling.
+MISSING = pd.NA
+MISSING_DTYPE = "string"
+
+# Everything that has meant the same thing in a column written before that:
+# "None" is what og_cell/og_type/{col}_type held, "none" is what a column that
+# had been through `SupportFuncs.ParamSweeper._normalize_missing` held, and the
+# rest are how a null can arrive back as text. `normalize_labels` collapses them.
+MISSING_SPELLINGS = ("None", "none", "nan", "NaN", "NA", "<NA>", "")
+
+
+def parse_cell_ids(value):
+    """Read a stored ``{cell_id: score}`` map back into a dict.
+
+    The maps are written as JSON, which parses an order of magnitude faster than
+    a python repr does -- `ast.literal_eval` compiles every string it is handed,
+    and this is called once per transcript. Stores written before the switch hold
+    a repr instead, so those fall back to `literal_eval`; the attempt costs
+    nothing on the JSON path.
+    """
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return ast.literal_eval(value)
+
+
+def dump_cell_ids(assigned):
+    """Serialise a ``{cell_id: score}`` map for storage.
+
+    Built directly rather than through ``json.dumps``: the maps are always
+    ``{str: float}``, so the encoder's generality costs about twice what writing
+    the text out does, once per transcript.
+    """
+    return "{" + ",".join(f'"{k}":{v}' for k, v in assigned.items()) + "}"
+
+
 def sigm(x, x0=0, k=0.05):
     return 1 / (1 + np.e ** (-1 * k * (x - x0)))
 
 
-def signed_distance(geom, xs, ys):
+def bounding_circle(geom):
+    """A circle containing the whole geometry, as ``(cx, cy, radius)``.
+
+    Centred on the bounding box, with the radius reaching the outermost vertex.
+    Reading the vertices is the one costly part of screening points, so this is
+    computed once per polygon and handed to `signed_distance` from then on.
+    """
+    minx, miny, maxx, maxy = geom.bounds
+    cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
+    coords = shapely.get_coordinates(geom)
+    radius = float(np.sqrt(((coords - (cx, cy)) ** 2).sum(axis=1)).max())
+    return cx, cy, radius
+
+
+def possibly_within(geom, xs, ys, max_dist, circle=None):
+    """Mask of the points that could be within ``max_dist`` of ``geom``.
+
+    Conservative: a point it excludes is provably farther than ``max_dist``, so
+    excluding it changes no result. It is allowed to keep points that turn out
+    to be far -- the exact measurement settles those.
+
+    Two containers are tested, and a point has to be near both:
+
+    * the geometry's bounding box. The geometry sits inside it, so nothing can
+      be nearer than the box is.
+    * a circle around the geometry's vertices. Every edge is inside it, so no
+      edge can be nearer than the circle is. This is the tighter of the two for
+      a roughly round cell, where the box is loose at the corners.
+
+    Both are compared as squared distances, which keeps a square root out of the
+    inner loop.
+    """
+    minx, miny, maxx, maxy = geom.bounds
+    dx = np.maximum(np.maximum(minx - xs, xs - maxx), 0.0)
+    dy = np.maximum(np.maximum(miny - ys, ys - maxy), 0.0)
+    near_box = (dx * dx + dy * dy) <= max_dist * max_dist
+
+    cx, cy, radius = circle if circle is not None else bounding_circle(geom)
+    reach = radius + max_dist
+    ex, ey = xs - cx, ys - cy
+    return near_box & ((ex * ex + ey * ey) <= reach * reach)
+
+
+def signed_distance(geom, xs, ys, max_dist=None, circle=None):
     """Signed distance from points to a polygon.
 
     Positive inside the geometry, negative outside, magnitude being the distance
     to the nearest edge. Vectorised over ``xs``/``ys`` (1D arrays). A
     ``MultiPolygon`` -- a cell whose slice has several disjoint pieces -- is
     measured as a whole, against the nearest edge of any of its parts.
+
+    ``max_dist`` is the distance beyond which the caller stops caring. Given it,
+    points that :func:`possibly_within` rules out never reach the measurement,
+    which is the expensive part -- an exact distance costs about fifty times what
+    the sign does. They come back as ``-inf``, which compares as "too far"
+    wherever the result is used. Pass ``circle`` from :func:`bounding_circle` to
+    screen without re-reading the geometry's vertices every call.
     """
     xs = np.asarray(xs, dtype=float)
     ys = np.asarray(ys, dtype=float)
-    dist = shapely.distance(geom.boundary, shapely.points(xs, ys))
-    return np.where(shapely.contains_xy(geom, xs, ys), dist, -dist)
+
+    if max_dist is None:
+        dist = shapely.distance(geom.boundary, shapely.points(xs, ys))
+        return np.where(shapely.contains_xy(geom, xs, ys), dist, -dist)
+
+    out = np.full(xs.shape, -np.inf)
+    near = np.flatnonzero(possibly_within(geom, xs, ys, max_dist, circle=circle))
+    if len(near) == 0:
+        return out
+
+    qx, qy = xs[near], ys[near]
+    dist = shapely.distance(geom.boundary, shapely.points(qx, qy))
+    out[near] = np.where(shapely.contains_xy(geom, qx, qy), dist, -dist)
+    return out
 
 
 class SoftAssigner:
@@ -72,6 +181,8 @@ class SoftAssigner:
         pool_size=1,
         conf_thresh=0.7,
         decay_func=None,
+        save_to_disk=True,
+        qc_bounds=None,
     ):
         """Initialize internal parameters.
 
@@ -90,11 +201,27 @@ class SoftAssigner:
         element that changes is saved to the zarr store the object came from.
         An sdata with no store on disk is worked on purely in memory.
 
+        save_to_disk: whether results are written to the store as they are
+           produced. True by default. Set it False to try something out without
+           touching what is on disk -- every result still lands in the sdata in
+           memory, and is lost when the object goes, unless `save_element` is
+           called for it later with the flag back on. Note that a pooled run
+           needs it: a worker returns its results by saving its own element.
+
+        qc_bounds: the QC the scoring matrix is built under, as any of
+           `{"min_counts", "max_counts", "min_genes", "min_cells"}`. Recorded
+           in the sdata, so it travels with the dataset and a later assigner over
+           the same store scores it the same way -- see `qc_bounds` and
+           `filter_for_scoring`. Left as None the stored bounds stand, and a
+           store that has none filters nothing.
+
         Passing a zarr-backed `sdata` is required when `pool_size > 1`: workers
         re-open the store themselves and save their own FOV's element, which is
         the only way their results get back to the parent.
         """
         self._set_sdata(sdata)
+        self._cell_to_type = None  # filled by get_scoring_matrix, or read back
+        self.save_to_disk = save_to_disk
         self.pool_size = pool_size
         self.logger = logging.getLogger()
         self.conf_thresh = conf_thresh
@@ -112,6 +239,9 @@ class SoftAssigner:
                 filename=f"{str(self._sdata_path).rstrip('/')}.{stamp}.run.log",
                 level=logging.DEBUG,
             )
+
+        if qc_bounds is not None:
+            self.set_qc_bounds(qc_bounds)
 
     # ----------------------------------------------------------------- #
     # SpatialData access                                                 #
@@ -137,6 +267,7 @@ class SoftAssigner:
                     "This SoftAssigner has no SpatialData attached; pass one to "
                     "__init__ or call _set_sdata()."
                 )
+            SpatialDataHelpers.quiet_ome_zarr()
             self._sdata = read_zarr(Path(self._sdata_path))
         return self._sdata
 
@@ -158,6 +289,9 @@ class SoftAssigner:
         has no location to be saved to, and its elements live only as long as it
         does.
 
+        Does nothing either when this assigner was built with
+        `save_to_disk=False`, which turns writing off wholesale.
+
         Rewriting an element in place is a delete followed by a write: zarr
         refuses to overwrite a path it is currently backing an element from. The
         replacement must therefore already be fully in memory (built through
@@ -166,6 +300,12 @@ class SoftAssigner:
         is not atomic -- an interruption between the two leaves the element only
         in memory, and re-running the step rewrites it.
         """
+        if not self.save_to_disk:
+            self.logger.debug(
+                f"[{datetime.now()}] save_to_disk is off; keeping {name} in memory."
+            )
+            return False
+
         saved = SpatialDataHelpers.save_element(self.sdata, name)
         if saved:
             self.logger.debug(f"[{datetime.now()}] saved element {name} to disk.")
@@ -223,8 +363,16 @@ class SoftAssigner:
             df = df[["index"] + [c for c in df.columns if c != "index"]]
         return df
 
-    def set_transcripts(self, fov, df):
+    def set_transcripts(self, fov, df, save=True):
         """Write a transcript table back into the FOV's points element.
+
+        fov: fov number, naming the element to replace.
+        df: the table to store, as `get_transcripts` returns it.
+
+        `save=False` updates the element in memory but leaves the store alone,
+        for a caller making many successive edits -- a parameter sweep, say --
+        that would otherwise rewrite the whole element each time. A later
+        `save_element` on the same name persists them.
 
         The element is replaced by one parsed from `df` -- carrying over the
         coordinate columns, the feature key and every coordinate transformation
@@ -235,7 +383,7 @@ class SoftAssigner:
 
         Columns holding python objects, such as the `{cell_id: score}` dicts in
         `cell_ids`, have to be stored as their `str()` repr -- parquet has no
-        type for them -- and are read back the same way, via `ast.literal_eval`.
+        type for them -- and are read back with `parse_cell_ids`.
         """
         key = self._points_key(fov)
         old = self.sdata.points[key]
@@ -256,13 +404,256 @@ class SoftAssigner:
             transformations=transformations,
             **kwargs,
         )
-        self.save_element(key)
+        if save:
+            self.save_element(key)
 
-    def save_table(self, name, adata):
-        """Put an AnnData into the sdata as a table and save it."""
+    def save_table(self, name, adata, save=True):
+        """Put an AnnData into the sdata as a table, saved unless deferred.
+
+        name (string): the table's element name.
+        adata (AnnData): what to store under it.
+        save (bool): if True (default) the table is written to the store.
+        """
         self.sdata.tables[name] = adata
-        self.save_element(name)
+        if save:
+            self.save_element(name)
         return adata
+
+    def require_blurred(self, fov):
+        """Raise unless this FOV has been through `blur_fov`.
+
+        Everything downstream reads the `cell_ids` column, and without it the
+        failure would otherwise surface as a bare KeyError partway through
+        whatever was already running.
+        """
+        if not self.has_column(fov, "cell_ids"):
+            raise KeyError(
+                f"fov_{fov:0>4} has no 'cell_ids' column, so it has not been "
+                "through the blurring step yet. Run "
+                f"`blur_fov({fov!r}, min_size, max_dist)` for this FOV, or "
+                "`blur_all_fovs(min_size, max_dist)` for every outstanding one, "
+                "before assigning transcripts."
+            )
+
+    def region_table_names(self, assigned_col):
+        """The two tables `evaluate_overlapping_regions_single_fov` writes."""
+        return (f"assigned_trs_{assigned_col}", f"seg_is_default_{assigned_col}")
+
+    def region_rows(self, fov, assigned_trs, seg_is_default):
+        """One FOV's resolved assignments and region verdicts, as table rows.
+
+        `assigned_trs` becomes one row per (cell, transcript) pair and
+        `seg_is_default` one row per ambiguous region, each tagged with the FOV
+        they came from. Kept separate from writing them so that a pooled run can
+        hand these back from the worker and merge them in the parent, rather than
+        having every worker rewrite the same shared element.
+        """
+        cells, ids = [], []
+        for cell, transcripts in assigned_trs.items():
+            cells.extend([str(cell)] * len(transcripts))
+            ids.extend(float(t) for t in transcripts)
+        trs = pd.DataFrame(
+            {
+                "fov": pd.Series([str(fov)] * len(cells), dtype=object),
+                "cell_id": pd.Series(cells, dtype=object),
+                "transcript_id": pd.Series(ids, dtype=float),
+            }
+        )
+
+        regions = list(seg_is_default)
+        seg = pd.DataFrame(
+            {
+                "fov": pd.Series([str(fov)] * len(regions), dtype=object),
+                "region": pd.Series(
+                    [",".join(str(c) for c in r) for r in regions], dtype=object
+                ),
+                "is_default": pd.Series(
+                    [bool(seg_is_default[r]) for r in regions], dtype=bool
+                ),
+            }
+        )
+        return trs, seg
+
+    def _merge_region_rows(self, name, frames, overwrite):
+        """A table's existing rows with these FOVs' rows merged in.
+
+        Rows for a FOV already in the table are replaced when `overwrite` is set,
+        and left alone otherwise -- in which case that FOV's incoming rows are
+        dropped. Returns None when nothing is left to write, so an existing table
+        is not rewritten identically.
+        """
+        existing = self.sdata.tables.get(name)
+        old = None if existing is None else existing.obs.reset_index(drop=True)
+
+        # nothing to record and nothing recorded: an empty element for data that
+        # does not exist is just noise. An existing table is still rewritten, so
+        # `overwrite` can clear a FOV's rows.
+        if existing is None and not any(len(rows) for rows in frames.values()):
+            return None
+
+        keep = dict(frames)
+        if old is not None and len(old):
+            present = set(old["fov"])
+            if overwrite:
+                old = old[~old["fov"].isin({str(f) for f in keep})]
+            else:
+                skipped = [f for f in keep if str(f) in present]
+                for f in skipped:
+                    del keep[f]
+                if skipped:
+                    self.logger.info(
+                        f"[{datetime.now()}] {name}: keeping the rows already "
+                        f"there for {skipped}; pass overwrite to replace them."
+                    )
+        if not keep:
+            return None
+
+        parts = [old] if old is not None and len(old) else []
+        parts.extend(keep.values())
+        obs = pd.concat(parts, ignore_index=True)
+        obs.index = [str(i) for i in range(len(obs))]
+        return ad.AnnData(np.zeros((len(obs), 0)), obs=obs)
+
+    def save_region_tables(self, rows, assigned_col, overwrite=True, save=True):
+        """Store how an assignment was reached, as two tables for the whole run.
+
+        The assignment column on the points says where each transcript ended up;
+        these say how it got there. One pair of tables per `assigned_col`, each
+        holding every FOV's rows and carrying a `fov` column, so a whole run
+        reads as a single table. Both keep their content in `obs`, since neither
+        is a measurement over variables.
+
+        rows (dict): `{fov: (trs_rows, seg_rows)}`, as `region_rows` builds them.
+        overwrite (bool): whether rows already present for one of these FOVs are
+            replaced. False leaves them, and drops the incoming rows.
+
+        returns: the names written, which is empty if every FOV was left alone.
+        """
+        written = []
+        for name, i in zip(self.region_table_names(assigned_col), (0, 1)):
+            merged = self._merge_region_rows(
+                name, {f: r[i] for f, r in rows.items()}, overwrite
+            )
+            if merged is None:
+                continue
+            self.save_table(name, merged, save=save)
+            written.append(name)
+        return written
+
+    def as_label_column(self, values, index):
+        """One of the assignment columns, with one spelling for "not assigned".
+
+        `assigned_col`, `og_cell`, `og_type` and `f"{assigned_col}_type"` all
+        name a cell or a cell type per transcript, and all four have to say "no
+        cell here" the same way -- a column that spelt it differently to its
+        neighbours used to reach `int()` in `SupportFuncs.ParamSweeper` and raise
+        "invalid literal for int(): 'None'".
+
+        The spelling is `MISSING` (`pd.NA`) in a `MISSING_DTYPE` ("string")
+        column. That is what parquet gives back for any absent value, whether it
+        went in as None, NaN or pd.NA, so writing it means the column reads back
+        as it was written rather than changing type on the first reload. It also
+        costs a bit in the validity bitmap rather than a stored value, unlike the
+        sentinel string "None" this used to write -- a small saving in practice,
+        since parquet dictionary-encodes a repeated sentinel anyway.
+
+        values: the column's contents, or None for an all-absent column.
+        index: the transcript table's index, for an all-absent column.
+        """
+        if values is None:
+            return pd.Series(MISSING, index=index, dtype=MISSING_DTYPE)
+        if isinstance(values, pd.Series):
+            # already carries the table's index; converting in place avoids
+            # realigning it against a copy of itself
+            return values.astype(MISSING_DTYPE)
+        return pd.Series(values, index=index, dtype=MISSING_DTYPE)
+
+    @staticmethod
+    def normalize_labels(df, column):
+        """Rewrite one assignment column's absent values as `MISSING`, in place.
+
+        For a table written before `as_label_column` settled the spelling, where
+        "no cell here" could be any of `MISSING_SPELLINGS` as well as a null.
+        Afterwards the column matches what this class writes now: `MISSING_DTYPE`
+        throughout, with `MISSING` wherever a value is absent. A column already
+        in that form is left as it is.
+
+        A cell id that reads back as a float (12.0 from an older store, say) is
+        written as "12" rather than "12.0", since the downstream consumers of
+        these columns put them through `int()`.
+
+        df (DataFrame): the table to edit, e.g. from `get_transcripts`.
+        column (string): which of its columns to rewrite.
+
+        returns: the same dataframe, for chaining.
+        """
+        values = df[column].astype(object)
+        absent = pd.isna(values).to_numpy(dtype=bool)
+        absent |= values.isin(MISSING_SPELLINGS).to_numpy(dtype=bool)
+
+        # a whole-numbered float is a cell id that lost its string on the way
+        # through some other format, not a distinct label
+        numeric = [
+            i
+            for i, v in enumerate(values)
+            if isinstance(v, (float, np.floating)) and not pd.isna(v) and v.is_integer()
+        ]
+        if numeric:
+            values.iloc[numeric] = [str(int(values.iloc[i])) for i in numeric]
+
+        values[absent] = MISSING
+        df[column] = values.astype(MISSING_DTYPE)
+        return df
+
+    CELL_TYPE_TABLE = "cell_to_type"
+
+    @property
+    def cell_to_type(self):
+        """Which cell type each cell was given -- `{cell id: cell type}`.
+
+        `get_scoring_matrix` builds this off the cell-by-gene table's cell type
+        column, and stores it in the sdata as the `CELL_TYPE_TABLE` table. An
+        assigner that has not run that method reads it back from there, so a
+        store that has been scored once can be picked up again -- to evaluate
+        more FOVs, say -- without rebuilding the scoring matrix first.
+
+        Note that only this mapping is stored, not `score_mat`: resolving an
+        overlapping region needs both, so reading this back lets you see and use
+        the cell types, but scoring still wants `get_scoring_matrix`.
+        """
+        if self._cell_to_type is None:
+            self._cell_to_type = self.load_cell_to_type()
+        return self._cell_to_type
+
+    @cell_to_type.setter
+    def cell_to_type(self, mapping):
+        self._cell_to_type = mapping
+
+    def save_cell_to_type(self, save=True):
+        """Store the cell-to-type mapping in the sdata as a table."""
+        cells = list(self._cell_to_type)
+        table = ad.AnnData(np.zeros((len(cells), 0)))
+        table.obs_names = [str(c) for c in cells]
+        table.obs["cell_id"] = pd.Series(
+            [str(c) for c in cells], index=table.obs_names, dtype=object
+        )
+        table.obs["cell_type"] = pd.Series(
+            [str(self._cell_to_type[c]) for c in cells],
+            index=table.obs_names, dtype=object,
+        )
+        return self.save_table(self.CELL_TYPE_TABLE, table, save=save)
+
+    def load_cell_to_type(self):
+        """Read the cell-to-type mapping back out of the sdata."""
+        if self.CELL_TYPE_TABLE not in self.sdata.tables:
+            raise KeyError(
+                f"No cell types available: this assigner has not run "
+                "`get_scoring_matrix`, and the sdata has no "
+                f"{self.CELL_TYPE_TABLE!r} table left by one that did. Run "
+                "`get_scoring_matrix()` first."
+            )
+        obs = self.sdata.tables[self.CELL_TYPE_TABLE].obs
+        return dict(zip(obs["cell_id"], obs["cell_type"]))
 
     def has_column(self, fov, column):
         """True if the FOV's transcript table already carries `column`.
@@ -311,6 +702,87 @@ class SoftAssigner:
         if not in_plane:
             return z_spacing
         return z_spacing / in_plane
+
+    BLUR_ATTRS = "blur"
+
+    def blur_params(self):
+        """The blur parameters recorded in the sdata, or None if there are none.
+
+        `blur_all_fovs` writes them, and reads them back to tell whether the
+        `cell_ids` columns already in the store were produced the way it is being
+        asked to produce them.
+        """
+        recorded = (getattr(self.sdata, "attrs", None) or {}).get(self.BLUR_ATTRS)
+        return dict(recorded) if isinstance(recorded, Mapping) else None
+
+    def set_blur_params(self, params, save=True):
+        """Record the blur parameters in the sdata, or clear them with None.
+
+        `blur_all_fovs` clears the key before it starts and writes it again once
+        every FOV is done, so a run that dies partway through leaves no key --
+        and a store with no key is one whose `cell_ids` columns nothing vouches
+        for.
+        """
+        attrs = dict(getattr(self.sdata, "attrs", None) or {})
+        if params is None:
+            attrs.pop(self.BLUR_ATTRS, None)
+        else:
+            attrs[self.BLUR_ATTRS] = dict(params)
+        self.sdata.attrs = attrs
+        if save and self.save_to_disk and self.sdata.is_backed():
+            self.sdata.write_attrs()
+        return attrs.get(self.BLUR_ATTRS)
+
+    QC_ATTRS = "qc_cells"
+    QC_KEYS = ("min_counts", "max_counts", "min_genes", "min_cells")
+
+    def qc_bounds(self):
+        """The scoring-matrix QC recorded in the sdata, or None if there is none.
+
+        These belong to the dataset rather than to the package: what counts as
+        too few transcripts for a cell depends on the panel, so the bounds that
+        suit a 500-gene MERFISH run would discard every cell of a simulation
+        whose cells carry thousands. Recording them here means a dataset is
+        scored the same way every time without anyone having to remember the
+        numbers.
+        """
+        recorded = (getattr(self.sdata, "attrs", None) or {}).get(self.QC_ATTRS)
+        return dict(recorded) if isinstance(recorded, Mapping) else None
+
+    def set_qc_bounds(self, bounds, save=True):
+        """Record the scoring-matrix QC in the sdata, or clear it with None.
+
+        bounds (dict): any of `QC_KEYS`; anything absent is left unbounded.
+        """
+        if bounds is not None:
+            unknown = set(bounds) - set(self.QC_KEYS)
+            if unknown:
+                raise ValueError(
+                    f"Unknown QC bound(s) {sorted(unknown)}; "
+                    f"expected any of {list(self.QC_KEYS)}."
+                )
+
+        attrs = dict(getattr(self.sdata, "attrs", None) or {})
+        if bounds is None:
+            attrs.pop(self.QC_ATTRS, None)
+        else:
+            attrs[self.QC_ATTRS] = dict(bounds)
+        self.sdata.attrs = attrs
+        if save and self.save_to_disk and self.sdata.is_backed():
+            self.sdata.write_attrs()
+        return attrs.get(self.QC_ATTRS)
+
+    def resolve_qc_bounds(self, **passed):
+        """What QC to apply: whatever was passed, else what the sdata records.
+
+        A bound given as None is an explicit "no filter" and overrides the
+        stored one; a bound left unpassed defers.
+        """
+        stored = self.qc_bounds() or {}
+        return {
+            key: stored.get(key) if value is UNSET else value
+            for key, value in passed.items()
+        }
 
     def valid_slices(self, fov):
         """The z-slice indices this FOV's segmentation covers.
@@ -418,7 +890,7 @@ class SoftAssigner:
         touching.discard(0)
         return {int(m) - 1 for m in touching}
 
-    def get_cell_shapes(self, fov, min_size=None, max_size=None):
+    def get_cell_shapes(self, fov, min_size=None, max_size=None, persist=True):
         """The FOV's cells as polygons, aggregated across the z axis.
 
         A 3D segmentation is held in the SpatialData as one 2D shapes element
@@ -442,7 +914,15 @@ class SoftAssigner:
         (`get_fov_affine`), which is not applied here.
 
         Cell ids follow the SoftSeg convention `cell_id = mask_value - 1`.
-        Cells outside the `min_size`/`max_size` voxel-count range are omitted.
+        Cells outside the `min_size`/`max_size` voxel-count range are omitted --
+        that filtering is applied to what is returned, never to what is stored,
+        so the kept shapes stay valid for any size range.
+
+        Newly contoured shapes are added to the sdata, and saved as well when
+        `persist` is set. Contouring a FOV's mask is by far the most expensive
+        part of blurring it, and the result depends only on the segmentation, so
+        it is worth keeping: a second blur of the same FOV -- another point in a
+        parameter sweep, say -- reads the shapes back instead of rebuilding them.
         """
         source = self.sdata
         try:
@@ -456,12 +936,18 @@ class SoftAssigner:
                 f"fov_{fov:0>4}: no z-slice shapes in the SpatialData, "
                 f"contouring {self._labels_key(fov)}."
             )
-            source = SpatialDataHelpers.masks_to_shapes(
+            built = SpatialDataHelpers.masks_to_shapes(
                 self.sdata,
                 labels_keys=[self._labels_key(fov)],
                 pool_size=1,
                 inplace=False,
             )
+            # Keep them. They go into the object either way, so even a run that
+            # is not writing anything only contours each FOV once.
+            for name, gdf in built.shapes.items():
+                self.sdata.shapes[name] = gdf
+                if persist:
+                    self.save_element(name)
             slices = SpatialDataHelpers._discover_zslice_shapes(source, fov)
 
         excluded = self._size_excluded_cells(fov, min_size, max_size)
@@ -490,7 +976,11 @@ class SoftAssigner:
         return [f for f in self.get_all_fovs() if self.has_column(f, column)]
 
     def get_incomplete_fovs(self, column="cell_ids"):
-        """Returns a list of all fov indicies that still need to be run by this object."""
+        """Returns a list of all fov indicies that still need to be run by this object.
+
+        The complement of `get_complete_fovs`: a FOV is outstanding while its
+        transcript table has no `column`.
+        """
         return [f for f in self.get_all_fovs() if not self.has_column(f, column)]
 
     def random_complete_fov(self):
@@ -510,7 +1000,7 @@ class SoftAssigner:
         # strip out all possible cell ids from tr
         eligible = set()
         for r, row in tr.iterrows():
-            assigned = ast.literal_eval(row["cell_ids"])
+            assigned = parse_cell_ids(row["cell_ids"])
             eligible.update(list(assigned.keys()))
 
         candidates = list(np.unique(im)[1:])
@@ -547,7 +1037,7 @@ class SoftAssigner:
         for f in self.get_complete_fovs():
             trs = self.get_transcripts(f)
             for i, row in trs.iterrows():
-                for c, v in ast.literal_eval(row["cell_ids"]).items():
+                for c, v in parse_cell_ids(row["cell_ids"]).items():
                     if int(c) in cell_ids:
                         results[int(c)] = f
                         if len(results) == len(cell_ids):
@@ -587,7 +1077,7 @@ class SoftAssigner:
         # collect relevant transcripts
         sel_tr = []
         for r, row in tr.iterrows():
-            assigned = ast.literal_eval(row["cell_ids"])
+            assigned = parse_cell_ids(row["cell_ids"])
             if "lank" not in row[gene_col_name] and any(
                 [str(cell) in assigned.keys() for cell in cells]
             ):
@@ -766,21 +1256,31 @@ class SoftAssigner:
         cell_id,
         geom,
         rows,
+        rows_x,
         x,
         y,
-        cell_ids,
+        hits,
         max_dist,
         projected_dist=None,
+        circle=None,
     ):
         """Score one cell's polygon against the transcripts on its z-slice.
 
-        rows: indices into x/y/cell_ids of the transcripts sitting on this slice.
+        rows: indices into x/y/cell_ids of the transcripts on this slice, in
+           ascending x order.
+        rows_x: their x values, so the band of candidates can be found without
+           touching the rest.
+        circle: this polygon's bounding circle, from `bounding_circle`, so the
+           far transcripts can be screened out without re-reading its vertices.
         projected_dist: if not None, this polygon comes from a *neighbouring*
            z-slice and every distance is lengthened by this out-of-plane offset.
 
         Transcripts further than max_dist outside the polygon are left alone;
-        the rest get `{cell_id: decay_func(signed distance)}` merged into their
-        entry of cell_ids.
+        for the rest, `(cell_id, transcript indices, scores)` is appended to
+        `hits`. The per-transcript dicts are built from those in one pass at the
+        end of `blur_fov`, which keeps this out of python entirely -- a dict
+        write per cell per transcript is the one part of the blur that cannot be
+        done on arrays.
         """
         if len(rows) == 0:
             return
@@ -788,19 +1288,31 @@ class SoftAssigner:
         # Only transcripts inside the polygon's bounding box (grown by max_dist)
         # can possibly be within max_dist of it. Projecting onto a neighbouring
         # slice only ever lengthens a distance, so this stays conservative.
+        #
+        # The x range is taken by binary search rather than by testing every
+        # transcript on the slice: a cell covers a small part of a FOV, so the
+        # band is a small part of the column, and the alternative costs one pass
+        # over every transcript for every cell.
         minx, miny, maxx, maxy = geom.bounds
-        xs, ys = x[rows], y[rows]
-        near = (
-            (xs >= minx - max_dist)
-            & (xs <= maxx + max_dist)
-            & (ys >= miny - max_dist)
-            & (ys <= maxy + max_dist)
-        )
+        lo = np.searchsorted(rows_x, minx - max_dist, side="left")
+        hi = np.searchsorted(rows_x, maxx + max_dist, side="right")
+        if lo >= hi:
+            return
+
+        rows = rows[lo:hi]
+        ys = y[rows]
+        near = (ys >= miny - max_dist) & (ys <= maxy + max_dist)
         rows = rows[near]
         if len(rows) == 0:
             return
 
-        dist = signed_distance(geom, x[rows], y[rows])
+        # the caller discards anything further than max_dist, so say so and let
+        # the cheap bounds throw those out before the distance is measured.
+        # A projected distance is only ever longer than the in-plane one, so the
+        # same cutoff stays conservative there too.
+        dist = signed_distance(
+            geom, x[rows], y[rows], max_dist=max_dist, circle=circle
+        )
 
         if projected_dist is not None:
             # the transcript is one slice away from the contour, so its true
@@ -811,44 +1323,103 @@ class SoftAssigner:
             dist = np.where(dist < 0, hypot, np.maximum(hypot, -1 * projected_dist))
 
         keep = dist > -1 * max_dist
-        name = str(cell_id)
-        for j, d in zip(rows[keep], dist[keep]):
-            # plain floats, so the dicts stay round-trippable through
-            # str() -> ast.literal_eval() when the table is written out
-            cell_ids[j][name] = float(self.decay_func(float(d)))
+        if not keep.any():
+            return
+
+        # Applied one element at a time, and to python floats, deliberately.
+        # Handing `decay_func` the whole array instead is about 6% quicker over
+        # a FOV, but `np.e ** array` and `np.e ** float` can differ by an ulp,
+        # and `assign_to_cell` compares the result against 0.5 and against a
+        # share of the transcript's total -- so a value on either boundary could
+        # land differently. Not worth trading an exact answer for.
+        kept = dist[keep]
+        scores = np.fromiter(
+            (float(self.decay_func(float(d))) for d in kept), float, len(kept)
+        )
+
+        hits.append((cell_id, rows[keep], scores))
 
     def blur_fov(
         self,
         f,
-        min_size,
-        max_dist,
+        min_size=25,
+        max_dist=20,
         dist_between_slices=None,
         project_neighbor_slices=True,
         disable_tqdm=False,
+        save=True,
+        overwrite=False,
+        check_params=True,
     ):
         """Run the first step of soft-segmentation, where masks are blurred and
-                multiple float values assigned to each transcript, corresponding to which
-                cells they may be members of and their relative likelihoods.
+        multiple float values assigned to each transcript, corresponding to which
+        cells they may be members of and their relative likelihoods.
 
-                Both the segmentation and the transcripts come from the bound SpatialData
-                object. A 3D segmentation is handled through
-                `SpatialDataHelpers.masks_to_shapes`, which splits the mask into one
-                polygon set per z-slice; `get_cell_shapes` reunites those slices per cell,
-                and each transcript is matched to its slice with the same rule
-                `SpatialDataHelpers.aggregate_zslice_shapes` uses.
+        Both the segmentation and the transcripts come from the bound SpatialData
+        object. A 3D segmentation is handled through
+        `SpatialDataHelpers.masks_to_shapes`, which splits the mask into one
+        polygon set per z-slice; `get_cell_shapes` reunites those slices per cell,
+        and each transcript is matched to its slice with the same rule
+        `SpatialDataHelpers.aggregate_zslice_shapes` uses.
 
-                f: fov number
-                min_size: minimum size for eligible masks, in voxels.
-                max_dist: the maximum distance between a transcript and a mask to be considered eligible.
-                dist_between_slices: for 3d data, slices with no contours within 1 zslice
-                 of a slice with a valid contour will project that contour with this added
-                 distance. If None (default), the spacing is read off the sdata's
-                 coordinate system (`get_dist_between_slices`).
-                project_neighbor_slices: set False to disable that projection entirely.
+        f: fov number
+        min_size: minimum size for eligible masks, in voxels.
+        max_dist: the maximum distance between a transcript and a mask to be considered eligible.
+        dist_between_slices: for 3d data, slices with no contours within 1 zslice
+            of a slice with a valid contour will project that contour with this
+            added distance. If None (default), the spacing is read off the sdata's
+            coordinate system (`get_dist_between_slices`).
+        project_neighbor_slices: set False to disable that projection entirely.
+        disable_tqdm: if True, this method will not print output or create its
+            own pbar entities.
+        save: if True (default) the transcript table is written back to the
+            store. False leaves the edit in memory for a later `save_element`.
+        overwrite: whether to redo a FOV that already has a `cell_ids` column.
+            False (default) skips it, since blurring the same mask with the same
+            parameters gives the same answer. `blur_all_fovs` sets this when the
+            parameters it was called with differ from the ones recorded in the
+            store.
+        check_params: warn when this FOV is about to be blurred with parameters
+            that do not match `attrs["blur"]`, or when nothing is recorded there
+            -- either way the FOV ends up disagreeing with the rest of the
+            dataset. `blur_all_fovs` turns this off, since it owns that key and
+            clears it for the duration of a run.
 
-        writes: the `cell_ids` column of the FOV's points element, saved to the store
-                returns: dataframe of transcript information (None during a pooled run)
+        writes: the `cell_ids` column of the FOV's points element, as JSON text,
+            saved unless `save` is False. Any `og_cell`/`og_type` left by an
+            earlier run is dropped, since both follow from `cell_ids`.
+        returns: dataframe of transcript information (None during a pooled run)
         """
+        if self.has_column(f, "cell_ids") and not overwrite:
+            self.logger.info(
+                f"[{datetime.now()}] skipping fov_{f:0>4}, cell_ids already present"
+            )
+            return None
+
+        if check_params:
+            params = {
+                "min_size": min_size,
+                "max_dist": max_dist,
+                "dist_between_slices": dist_between_slices,
+                "project_neighbor_slices": bool(project_neighbor_slices),
+            }
+            recorded = self.blur_params()
+            if recorded is None:
+                warnings.warn(
+                    f"Blurring fov_{f:0>4} with no dataset-wide blur parameters "
+                    f"recorded in attrs[{self.BLUR_ATTRS!r}]. Nothing says the "
+                    "other FOVs were blurred this way; run blur_all_fovs to do "
+                    "the whole dataset consistently and record how.",
+                    stacklevel=2,
+                )
+            elif recorded != params:
+                warnings.warn(
+                    f"Blurring fov_{f:0>4} with {params}, which differs from the "
+                    f"{recorded} recorded for this dataset. This FOV will not "
+                    "match the others.",
+                    stacklevel=2,
+                )
+
         tr = self.get_transcripts(f)
 
         if len(tr) > 0:
@@ -857,6 +1428,12 @@ class SoftAssigner:
             # override if if it's alraedy there'
             if "cell_ids" in tr.keys():
                 tr.drop(["cell_ids"], axis=1, inplace=True)
+
+            # og_cell/og_type are derived from cell_ids, so whatever a previous
+            # run left behind no longer describes this segmentation
+            stale = [c for c in ("og_cell", "og_type") if c in tr.columns]
+            if stale:
+                tr.drop(stale, axis=1, inplace=True)
 
             # the spacing between z-slices lives in the sdata's coordinate
             # system, so read it from there unless we were handed one
@@ -870,15 +1447,34 @@ class SoftAssigner:
             # z values, so resolve each transcript to a slice up front
             elig_z = self.valid_slices(f)
             slice_of_tr = self.transcript_slices(f, tr)
-            tr_by_slice = {z: np.flatnonzero(slice_of_tr == z) for z in elig_z}
-
             x = tr["x"].to_numpy(dtype=float)
             y = tr["y"].to_numpy(dtype=float)
-            cell_ids = [{} for _ in range(len(tr))]
+
+            # (cell id, transcript indices, scores) per cell per slice, turned
+            # into the per-transcript dicts once the whole FOV is scored
+            hits = []
+
+            # each slice's transcripts, ordered by x, so a cell can take the
+            # band it covers by binary search instead of testing all of them
+            tr_by_slice = {}
+            for z in elig_z:
+                rows = np.flatnonzero(slice_of_tr == z)
+                rows = rows[np.argsort(x[rows], kind="stable")]
+                tr_by_slice[z] = (rows, x[rows])
 
             # each cell as {z: polygon}, i.e. its 2D slices aggregated back
             # together along the z axis
-            shapes_by_cell = self.get_cell_shapes(f, min_size=min_size)
+            shapes_by_cell = self.get_cell_shapes(f, min_size=min_size, persist=save)
+
+            # One bounding circle per polygon, computed here and reused for
+            # every slice it is scored against. Deriving it inside the scoring
+            # loop instead would re-read the same vertices on every call, which
+            # costs more than the screening saves.
+            circles = {
+                (cell_id, z): bounding_circle(geom)
+                for cell_id, by_z in shapes_by_cell.items()
+                for z, geom in by_z.items()
+            }
 
             if not disable_tqdm:
                 pbar = tqdm(total=len(shapes_by_cell))
@@ -890,14 +1486,15 @@ class SoftAssigner:
                 by_z = shapes_by_cell[cell_id]
 
                 for z in elig_z:
-                    rows = tr_by_slice[z]
+                    rows, rows_x = tr_by_slice[z]
                     if len(rows) == 0:
                         continue
 
                     geom = by_z.get(z)
                     if geom is not None:
                         self._blur_one_shape(
-                            cell_id, geom, rows, x, y, cell_ids, max_dist
+                            cell_id, geom, rows, rows_x, x, y, hits, max_dist,
+                            circle=circles[(cell_id, z)],
                         )
                         continue
 
@@ -921,11 +1518,13 @@ class SoftAssigner:
                         cell_id,
                         by_z[neighbor],
                         rows,
+                        rows_x,
                         x,
                         y,
-                        cell_ids,
+                        hits,
                         max_dist,
                         projected_dist=dist_between_slices,
+                        circle=circles[(cell_id, neighbor)],
                     )
 
                 if not disable_tqdm:
@@ -936,11 +1535,22 @@ class SoftAssigner:
             if not disable_tqdm:
                 pbar.close()
 
+            # Assemble the per-transcript maps. `hits` is in ascending cell id
+            # order, so each transcript's candidates come out in that order too
+            # -- which `assign_to_cell` depends on, since it takes the first key
+            # clearing its thresholds. Iterating python lists rather than numpy
+            # arrays keeps this loop off numpy scalars, which are slow to unbox.
+            cell_ids = [{} for _ in range(len(tr))]
+            for cell_id, rows_hit, scores in hits:
+                name = str(cell_id)
+                for j, v in zip(rows_hit.tolist(), scores.tolist()):
+                    cell_ids[j][name] = v
+            del hits
+
             # parquet has no type for a python dict, so the per-transcript
-            # {cell_id: score} maps are stored as their str() repr and read back
-            # with ast.literal_eval
-            tr["cell_ids"] = [str(d) for d in cell_ids]
-            self.set_transcripts(f, tr)
+            # {cell_id: score} maps are stored as JSON text
+            tr["cell_ids"] = [dump_cell_ids(d) for d in cell_ids]
+            self.set_transcripts(f, tr, save=save)
 
             self.logger.info(
                 f"[{datetime.now()}] saved fov_{f:0>4}\n\t{len(tr)} transcripts"
@@ -974,11 +1584,12 @@ class SoftAssigner:
 
     def blur_all_fovs(
         self,
-        min_size,
-        max_dist,
+        min_size=25,
+        max_dist=20,
         dist_between_slices=None,
         project_neighbor_slices=True,
         sel_fovs=None,
+        save=True,
     ):
         """Run the first step of soft-segmentation, where masks are blurred and
         multiple float values assigned to each transcript, corresponding to which
@@ -989,13 +1600,50 @@ class SoftAssigner:
         pool_size: the number of threads to be used.
         min_size: minimum size for eligible masks.
         max_dist: the maximum distance between a transcript and a mask to be considered eligible.
+            Both default to the values a full vizgen MERFISH dataset was
+            processed and validated with; they are in voxels and pixels, so a
+            dataset at a different resolution will want its own.
         dist_between_slices: as in blur_fov; read per-FOV off the sdata's
             coordinate system when left as None.
+        project_neighbor_slices: as in blur_fov.
+        sel_fovs: FOVs to run on. Defaults to all of them; which ones actually
+            need doing is decided per FOV, below.
 
-        writes: the `cell_ids` column of every FOV's points element, saved to the store.
+        The parameters are recorded under `attrs["blur"]`, and compared against
+        what is already there. Matching them means the FOVs already carrying a
+        `cell_ids` column were blurred this same way, so those are left alone and
+        only the outstanding ones run -- which is what makes an interrupted run
+        resumable. Differing from them invalidates every existing column, so all
+        the FOVs are redone.
+
+        Each worker saves its own element, which is how its results get back
+        here, so this always writes; `blur_fov`'s deferred `save` is not
+        available through this runner.
+
+        writes: the `cell_ids` column of every FOV's points element, and
+            `attrs["blur"]`, saved to the store.
         """
         if sel_fovs is None:
-            sel_fovs = self.get_incomplete_fovs()
+            sel_fovs = self.get_all_fovs()
+
+        params = {
+            "min_size": min_size,
+            "max_dist": max_dist,
+            "dist_between_slices": dist_between_slices,
+            "project_neighbor_slices": bool(project_neighbor_slices),
+        }
+        recorded = self.blur_params()
+        overwrite = recorded != params
+        if overwrite and recorded is not None:
+            self.logger.info(
+                f"Blur parameters changed from {recorded} to {params}; "
+                "re-blurring every FOV."
+            )
+
+        # Cleared for the duration: until every FOV is done there is no single
+        # set of parameters that describes the dataset, and a run that does not
+        # finish should not leave one behind.
+        self.set_blur_params(None, save=save)
 
         self._run_over_fovs(
             zip(
@@ -1006,10 +1654,17 @@ class SoftAssigner:
                 repeat(dist_between_slices),
                 repeat(project_neighbor_slices),
                 repeat(True),
+                repeat(save),
+                repeat(overwrite),
+                repeat(False),  # this method owns attrs["blur"]; see check_params
             ),
             len(sel_fovs),
-            self.pool_size,
+            # a worker hands its results back by saving them, so with saving off
+            # there is nothing to run in parallel
+            self.pool_size if save else 1,
         )
+
+        self.set_blur_params(params, save=save)
 
     def combine_soft_transcripts(self, sel_fovs=None):
         """Every FOV's soft-assignment table, concatenated into one dataframe.
@@ -1069,108 +1724,85 @@ class SoftAssigner:
         """
         Finds the ideal threshold for what should be considered a 'confident' assignment.
 
+        Reads every completed FOV's `cell_ids`, then sweeps 60 candidate
+        thresholds over the lot, counting at each how many transcripts get
+        assigned and how many cells end up with more than 10 of them.
+
+        show_plots (bool): if True, draw the assigned-transcripts against
+            unique-cells curve and its first two derivatives.
+
+        Sets `self.conf_thresh` to the conservative threshold, and
+        `self.num_transcripts` to the number of transcripts it read.
+
         returns:
         "aggresive": defines threshold as elbow point of assigned transcripts vs
             multiply-assigned transcripts plot.
         "conservative": defines threshold as lowest value where no transcript is
             multiply-assigned.
         """
-        if hasattr(self, "num_transcripts"):
-            tr_tally = self.num_transcripts
-        else:
-            tr_tally = 10000000
-        n_wid = 12  # initial guess for max number of cells a transcript is assigned to
-        cells = [np.empty((tr_tally, n_wid))]
-        cutoff = [np.empty((tr_tally, n_wid))]
-        mat_ind = 0
-        c_row = 0
-        c_row_total = 0
-        cell_list = set()
-
         sel_fovs = self.get_complete_fovs()
 
+        # Read every transcript's {cell: score} map, walking the column as an
+        # array rather than with `iterrows` -- the per-row Series that yields is
+        # most of the cost and none of the work.
+        per_fov = []
+        width = 1
         for f in sel_fovs:
             self.logger.info(f"Reading in fov {f}\t{datetime.now()}")
             tr = self.get_transcripts(f)
-            for r, row in tr.iterrows():
-                assigned = ast.literal_eval(row["cell_ids"])
-                ind = 0
-
-                # make the mat wider if needed
-                if np.shape(cutoff[mat_ind])[1] < len(assigned):
-                    n_wid = len(assigned)  # - np.shape(cutoff)[1]
-                    cells = np.append(
-                        cells[mat_ind], np.empty((tr_tally, n_wid)), axis=1
-                    )
-                    cutoff = np.append(
-                        cutoff[mat_ind], np.empty((tr_tally, n_wid)), axis=1
-                    )
-                    n_wid = np.shape(cutoff)[1]
-
-                if np.shape(cutoff[mat_ind])[0] == c_row:  # go to next ind
-                    cells.append(np.empty((tr_tally, n_wid)))
-                    cutoff.append(np.empty((tr_tally, n_wid)))
-                    mat_ind += 1
-                    c_row_total += c_row
-                    c_row = 0
-
-                # transfer in our floats...
-                for k, v in assigned.items():
-                    cells[mat_ind][c_row, ind] = k
-                    cutoff[mat_ind][c_row, ind] = v
-                    ind += 1
-                    cell_list.update(k)
-
-                c_row += 1
+            parsed = [parse_cell_ids(raw) for raw in tr["cell_ids"].to_numpy()]
+            width = max(width, max((len(a) for a in parsed), default=1))
+            per_fov.append(parsed)
             self.logger.info(
-                f"Just completed fov_{f:0>4}, mat number {mat_ind}, current c_row {c_row + c_row_total}"
+                f"Just completed fov_{f:0>4}, {len(parsed)} transcripts"
             )
 
-        # now merge the lists, if we need to
-        combined = np.empty((0, n_wid))
-        for c in cells:
-            combined = np.append(combined, c, axis=0)
-        del cells
-        cells = combined
-
-        combined_cutoff = np.empty((0, n_wid))
-        for c in cutoff:
-            combined_cutoff = np.append(combined_cutoff, c, axis=0)
-        del cutoff
-        cutoff = combined_cutoff
+        # One row per transcript, padded to the widest candidate list. The size
+        # comes from the data: the previous version reserved 10 million rows when
+        # `num_transcripts` had not been set, and every row it left unwritten
+        # stayed uninitialised memory that the sweep below then scored as though
+        # it were a transcript.
+        n_tr = sum(len(p) for p in per_fov)
+        cells = np.full((n_tr, width), -1.0)
+        cutoff = np.zeros((n_tr, width))  # padding scores 0: never selectable
+        r = 0
+        for parsed in per_fov:
+            for assigned in parsed:
+                for ind, (k, v) in enumerate(assigned.items()):
+                    cells[r, ind] = float(k)
+                    cutoff[r, ind] = float(v)
+                r += 1
+        del per_fov
+        self.num_transcripts = n_tr
 
         assigned_tr = []
         cell_dist = []
         num = 60  # resolution for estimate
         rang = np.linspace(0.01, 0.60, num=num)
 
+        # now some basic filtering like we do when clustering
+        # remove cells that do not reach a specific transcript count
+        min_count = 10
+
+        # `assign_to_cell` takes the first candidate whose score is at least 0.5
+        # and more than `thresh` of the transcript's total. Both tests are the
+        # same for every threshold bar the comparison itself, so they are done
+        # over the whole array at once rather than a dict per transcript.
+        totals = cutoff.sum(axis=1)
+        scored = totals > 0
+        share = cutoff / np.where(scored, totals, 1.0)[:, None]
+        strong = cutoff >= 0.5
+        rows = np.arange(n_tr)
+
         for thresh in rang:
-            # this is going to be a bit slower but whatever
-            this_tr = 0
-            this_cells = []
-            for i in range(len(cells)):
-                cell = self.assign_to_cell(
-                    {cells[i][j]: cutoff[i][j] for j in range(len(cells[i]))}, thresh
-                )
-                if cell is not None:
-                    this_tr += 1
-                    this_cells.append(cell)
+            ok = strong & (share > thresh)
+            hit = ok.any(axis=1) & scored
+            chosen = cells[rows, ok.argmax(axis=1)][hit]
 
-            assigned_tr.append(this_tr)
+            assigned_tr.append(int(hit.sum()))
 
-            # now some basic filtering like we do when clustering
-            # remove cells that do not reach a specific transcript count
-            min_count = 10
-
-            counts = Counter(this_cells)
-            tally = 0
-            for k, v in counts.items():
-                if k == 0.0:
-                    continue
-                if v > min_count:
-                    tally += 1
-
-            cell_dist.append(tally)
+            uniq, counts = np.unique(chosen, return_counts=True)
+            cell_dist.append(int(((counts > min_count) & (uniq != 0.0)).sum()))
 
         dif1 = np.diff(cell_dist)
         dif2 = np.diff(dif1)
@@ -1231,7 +1863,7 @@ class SoftAssigner:
             },
         }
 
-    def convert_to_adata(
+    def generate_cxg_table(
         self,
         gene_col_name="gene",
         min_thresh=None,
@@ -1240,7 +1872,7 @@ class SoftAssigner:
         table_name=None,
     ):
         """
-        Converts all completed analyses to adata format.
+        Builds the cell-by-gene table from all completed analyses.
 
         The result is stored as a table in the sdata (and saved to the store)
         under `table_name`, defaulting to "cxg", or
@@ -1275,11 +1907,18 @@ class SoftAssigner:
                         f"{assigned_col} not in df for fov_{f:0>4}, skipping."
                     )
                     continue
-                tr = tr[~pd.isnull(tr[assigned_col])]
+                # Absent is MISSING, so the nulls drop out here. "None" is how
+                # a column written before `as_label_column` spelt it, and an
+                # older store still has to be readable -- left in, the sentinel
+                # reaches the int() below and raises.
+                labels = tr[assigned_col]
+                keep = labels.notna().to_numpy(dtype=bool)
+                keep &= (labels != "None").fillna(False).to_numpy(dtype=bool)
+                tr = tr[keep]
                 tallies = Counter(list(zip(tr[gene_col_name], tr[assigned_col])))
             else:
                 cell_col = tr.cell_ids.apply(
-                    lambda x: self.assign_to_cell(ast.literal_eval(x), min_thresh)
+                    lambda x: self.assign_to_cell(parse_cell_ids(x), min_thresh)
                 )
                 inds = cell_col.apply(lambda x: x is not None)
                 tallies = Counter(list(zip(tr[gene_col_name][inds], cell_col[inds])))
@@ -1305,7 +1944,11 @@ class SoftAssigner:
         # depend on row order rather than on the data
         cxg_df = cxg_df.reindex(sorted(cxg_df.columns), axis=1).sort_index()
 
-        adata = ad.AnnData(cxg_df)
+        # AnnData wants string observation names and a float matrix, and converts
+        # both itself with a warning apiece. Doing it here instead -- after the
+        # sort above, which wants the numeric ids -- gives the same table quietly.
+        cxg_df.index = cxg_df.index.astype(str)
+        adata = ad.AnnData(cxg_df.astype(float))
 
         adata.obs["fov"] = pd.Series(
             [None] * len(adata), index=adata.obs.index, dtype=object
@@ -1358,32 +2001,254 @@ class SoftAssigner:
         print(f"Saved table {table_name!r}")
         return adata
 
-    def get_scoring_matrix(self, adata, cats, normed=True):
+    # obs columns `generate_cxg_table` writes itself: bookkeeping and geometry,
+    # never cell types, so they are never candidates when `cats` is inferred
+    CXG_OBS_COLUMNS = ("fov", "size", "x_coords", "y_coords", "z_coords")
+
+    def default_cxg_table(self, table_name=None):
+        """The cell-by-gene table `generate_cxg_table` left in the sdata.
+
+        Prefers `table_name`, then "cxg" -- what `generate_cxg_table` writes by
+        default -- then a single "cxg*" table if that is the only candidate. A
+        store holding several is ambiguous and says so rather than guessing.
+        """
+        tables = list(self.sdata.tables)
+        if table_name is not None:
+            if table_name not in tables:
+                raise KeyError(f"No table {table_name!r} in this sdata; have {tables}")
+            return self.sdata.tables[table_name]
+
+        if "cxg" in tables:
+            return self.sdata.tables["cxg"]
+
+        candidates = [t for t in tables if t.startswith("cxg")]
+        if len(candidates) == 1:
+            return self.sdata.tables[candidates[0]]
+        raise KeyError(
+            "Could not tell which table to score against. Run "
+            "`generate_cxg_table()` first, or name one with `table_name=`; "
+            f"this sdata has {tables}."
+            if not candidates
+            else "Several cell-by-gene tables are present "
+            f"({candidates}); name the one to use with `table_name=`."
+        )
+
+    def infer_cats(self, adata, column=None):
+        """Read a table's cell type categories, as `cats` for scoring.
+
+        `column` names the obs column holding the types, and its labels are
+        taken from what is actually in it. Without one, the column is looked for
+        too: a cell type column holds labels rather than numbers or identifiers,
+        so it is of categorical or object dtype, is not one of the columns
+        `generate_cxg_table` writes itself, and is not unique per cell. Exactly
+        one such column is needed to be unambiguous; otherwise the caller is
+        asked which to use.
+        """
+        def labels_of(col):
+            values = adata.obs[col]
+            return sorted(
+                str(v) for v in pd.unique(values.dropna()) if str(v) != "nan"
+            )
+
+        if column is not None:
+            if column not in adata.obs.columns:
+                raise KeyError(
+                    f"No obs column {column!r} on this table; have "
+                    f"{list(adata.obs.columns)}."
+                )
+            labels = labels_of(column)
+            if not labels:
+                raise ValueError(
+                    f"The obs column {column!r} holds no cell type labels."
+                )
+            self.logger.info(f"Scoring against obs column {column!r}: {labels}")
+            return {column: labels}
+
+        candidates = {}
+        for col in adata.obs.columns:
+            if col in self.CXG_OBS_COLUMNS:
+                continue
+            values = adata.obs[col]
+            if not (isinstance(values.dtype, pd.CategoricalDtype)
+                    or values.dtype == object):
+                continue
+            labels = labels_of(col)
+            if not labels or len(labels) >= len(adata):
+                continue  # empty, or an identifier rather than a type
+            candidates[col] = labels
+
+        if len(candidates) == 1:
+            col, labels = next(iter(candidates.items()))
+            self.logger.info(f"Scoring against obs column {col!r}: {labels}")
+            return {col: labels}
+        raise ValueError(
+            "Could not tell which obs column holds the cell types"
+            + (f" -- candidates are {sorted(candidates)}" if candidates else "")
+            + ". Name one by passing cats='column name', or give them in full "
+            "as cats={'column name': ['cell type', ...]}. The table needs to "
+            "have been annotated, e.g. by CellTypeAssigner."
+        )
+
+    @staticmethod
+    def _per_cell_and_gene(X):
+        """Totals a QC filter needs: per cell, then per gene.
+
+        Handles a sparse X as well as a dense one -- both answer `.sum(axis=)`,
+        though a sparse one answers with a matrix, hence the ravel.
+        """
+        counts = np.asarray(X.sum(axis=1)).ravel()
+        genes_per_cell = np.asarray((X > 0).sum(axis=1)).ravel()
+        cells_per_gene = np.asarray((X > 0).sum(axis=0)).ravel()
+        return counts, genes_per_cell, cells_per_gene
+
+    def filter_for_scoring(
+        self, adata, min_counts=None, max_counts=None, min_genes=None,
+        min_cells=None,
+    ):
+        """Drop the cells and genes that should not shape the scoring matrix.
+
+        The same QC the pre-package notebooks ran over the cell-by-gene table
+        before scoring it, by way of `CellTypeAssigner.filter_cells` and
+        `filter_genes` -- a cell carrying too few transcripts has a profile that
+        is mostly noise, and a gene seen in too few cells says little about any
+        type. Applied here instead so the scoring matrix can be filtered without
+        a separate filtered copy of the table.
+
+        min_counts / max_counts (int): keep cells whose total transcript count is
+            within these bounds.
+        min_genes (int): keep cells expressing at least this many distinct genes.
+        min_cells (int): keep genes expressed in at least this many cells, after
+            the cell filters have been applied.
+
+        Note what a dropped cell means downstream: it is absent from
+        `cell_to_type`, so it is untyped, and an overlapping region containing it
+        is skipped unless `use_other_cells=True`. A dropped gene simply stops
+        contributing to any score, as a blank does.
+
+        returns: the filtered AnnData, or the original when nothing was asked
+            for. Never modifies the table it was given.
+        """
+        wanted = (min_counts, max_counts, min_genes, min_cells)
+        if all(v is None for v in wanted):
+            return adata
+
+        counts, genes_per_cell, _ = self._per_cell_and_gene(adata.X)
+        keep_cells = np.ones(adata.n_obs, dtype=bool)
+        if min_counts is not None:
+            keep_cells &= counts >= min_counts
+        if max_counts is not None:
+            keep_cells &= counts <= max_counts
+        if min_genes is not None:
+            keep_cells &= genes_per_cell >= min_genes
+
+        if not keep_cells.any():
+            raise ValueError(
+                f"Every one of the {adata.n_obs} cells was filtered out "
+                f"(min_counts={min_counts}, max_counts={max_counts}, "
+                f"min_genes={min_genes}). Transcript counts run "
+                f"{counts.min():g}-{counts.max():g}."
+            )
+
+        out = adata[keep_cells]
+        if min_cells is not None:
+            # counted after the cell filter, so a gene is judged on the cells
+            # that are actually being scored
+            _, _, cells_per_gene = self._per_cell_and_gene(out.X)
+            keep_genes = cells_per_gene >= min_cells
+            if not keep_genes.any():
+                raise ValueError(
+                    f"Every one of the {adata.n_vars} genes was filtered out "
+                    f"(min_cells={min_cells}). A gene appears in at most "
+                    f"{cells_per_gene.max():g} of the {int(keep_cells.sum())} "
+                    "cells that survived the cell filters."
+                )
+            out = out[:, keep_genes]
+
+        self.logger.info(
+            f"[{datetime.now()}] scoring matrix QC: kept "
+            f"{out.n_obs} of {adata.n_obs} cells and "
+            f"{out.n_vars} of {adata.n_vars} genes."
+        )
+        # a view shares the parent's n_obs in places, so hand back a real object
+        return out.copy()
+
+    def get_scoring_matrix(
+        self, adata=None, cats=None, normed=False, table_name=None, save=True,
+        min_counts=UNSET, max_counts=UNSET, min_genes=UNSET, min_cells=UNSET,
+    ):
         """
         Need to run this before evaluate_overlapping_regions
-        cats is the possible cell types as they are described in adata
-        formatted as
-        { "column name":["cell type", "cell type"], ...}
+
+        cats is the possible cell types as they are described in adata. Give it
+        either way round:
+          {"column name": ["cell type", "cell type"], ...}  -- in full
+          "column name"                                     -- the column that
+              holds the types, whose labels are then read off it
+          None                                              -- find that column
+              too, when the table has exactly one that could hold cell types
+
+        adata likewise defaults to the cell-by-gene table `generate_cxg_table`
+        stored in the sdata (see `default_cxg_table`), so with nothing passed at
+        all this scores the table the pipeline just produced. `table_name` names
+        which table to read when a store holds more than one.
+
+        The cell-to-type mapping this builds is stored in the sdata as the
+        `CELL_TYPE_TABLE` table, so `cell_to_type` can be read back by a later
+        assigner over the same store. `save=False` keeps that in memory only.
+
+        min_counts / max_counts / min_genes / min_cells: QC bounds applied to a
+        copy of the table before it is scored, as `filter_for_scoring` describes
+        -- cells carrying too few (or too many) transcripts or expressing too few
+        genes are dropped, then genes seen in too few of the remaining cells. The
+        stored table is not touched. A filtered-out cell ends up untyped, so an
+        overlapping region containing it is skipped unless `use_other_cells`.
+        Left unpassed, each defers to what the sdata records (`qc_bounds`, set at
+        init or with `set_qc_bounds`); passing None turns that filter off for
+        this call. A store with no recorded bounds filters nothing.
         """
+        if adata is None:
+            adata = self.default_cxg_table(table_name)
+        adata = self.filter_for_scoring(
+            adata,
+            **self.resolve_qc_bounds(
+                min_counts=min_counts, max_counts=max_counts,
+                min_genes=min_genes, min_cells=min_cells,
+            ),
+        )
+        if cats is None or isinstance(cats, str):
+            cats = self.infer_cats(adata, column=cats)
+
         all_avg = np.average(adata.X, axis=0)
 
-        filtered = {}
-        for k, v in cats.items():
-            for cat in v:
-                filtered[cat] = deepcopy(adata[adata.obs[k] == cat])
-
+        # Each type's rows are taken by index off the matrix. Subsetting the
+        # AnnData and deep-copying the result, as this used to, duplicates the
+        # whole expression matrix once per cell type to compute one mean of it.
+        X = adata.X
         avgs = {}
-        for k, v in filtered.items():
-            avgs[k] = np.average(v.X, axis=0)
+        counts = {}
+        for k, v in cats.items():
+            column = adata.obs[k].to_numpy()
+            for cat in v:
+                rows = np.flatnonzero(column == cat)
+                if not len(rows):
+                    # the QC bounds can empty a type out; averaging nothing
+                    # would put nan across its whole row
+                    self.logger.info(
+                        f"[{datetime.now()}] no cells left of type {cat!r} after "
+                        "filtering, so it is left out of the scoring matrix."
+                    )
+                    continue
+                avgs[cat] = np.average(X[rows], axis=0)
+                counts[cat] = len(rows)
 
-        filtered["other"] = [0] * len(adata.X)
         avgs["other"] = all_avg
+        counts["other"] = len(adata)
 
         df_avg = pd.DataFrame.from_dict(avgs, orient="index", columns=adata.var.index)
         if normed:
-            norm_total = sum([len(x) for k, x in filtered.items()])
+            norm_total = sum(counts.values())
             df_normed = df_avg.multiply(
-                [(norm_total - len(x)) / norm_total * 100 for x in filtered.values()],
+                [(norm_total - n) / norm_total * 100 for n in counts.values()],
                 axis=0,
             )
 
@@ -1394,13 +2259,24 @@ class SoftAssigner:
         self.score_mat = df_comp.fillna(0).to_dict()
 
         # generating cell_to_type dict, while we have our hands on cats
+        # Written a type at a time rather than a cell at a time: `iterrows`
+        # builds a Series per cell, which on a real table is most of the cost.
+        # A cell matching more than one entry still ends up with the last one,
+        # since the loops run in the same order.
         self.cell_to_type = {}  # key: cell ID, value: cell type
         self.tr_to_gene = {}  # key: transcript ID, value: gene name
-        for r, row in adata.obs.iterrows():
-            for key_type, cell_types in cats.items():
-                for cell_type in cell_types:
-                    if row[key_type] == cell_type:
-                        self.cell_to_type[r] = cell_type
+        names = adata.obs_names.to_numpy()
+        for key_type, cell_types in cats.items():
+            column = adata.obs[key_type].to_numpy()
+            for cell_type in cell_types:
+                if cell_type not in avgs:
+                    continue  # filtered out entirely, so it scores nothing
+                for name in names[column == cell_type]:
+                    self.cell_to_type[name] = cell_type
+
+        # kept in the sdata so a later assigner over the same store can read the
+        # cell types back rather than having to be handed them again
+        self.save_cell_to_type(save=save)
 
     def score_tr_assignment(self, assignment, mse_score=False):
         score = 0
@@ -1516,7 +2392,7 @@ class SoftAssigner:
         while len(sel_cells) > 1:
             # find transcript with lowest assignment score for prev cell
             min_tr = todo_trs[i_cell][np.argmin(todo_trs[i_cell][:, 1]), 0]
-            min_assigned = ast.literal_eval(
+            min_assigned = parse_cell_ids(
                 all_trs[all_trs.index == min_tr]["cell_ids"].values[0]
             )
 
@@ -1591,56 +2467,63 @@ class SoftAssigner:
             result["other"] = list(interim_result)
         return result
 
-    def evaluate_overlapping_regions_single_fov(
+    def scan_overlapping_regions(
         self,
         f,
         gene_col_name="gene",
-        min_thresh=None,
-        default_thresh=5,
+        min_thresh=0.7,
         only_tagged_cells=None,
-        use_conf_trs=False,
         use_other_cells=False,
-        use_mse_score=False,
-        assigned_col="assignment",
-        omit_blanks=False,
+        omit_blanks=True,
         auto_assign_single_target=False,
-        save_delta_tallies=False,
         disable_tqdm=False,
-        overwrite=False,
     ):
-        """
-        Scores and re-assigns border region transcripts for a single FOV.
+        """Sort a FOV's transcripts into confident and ambiguous assignments.
+
+        The first half of `evaluate_overlapping_regions_single_fov`, and the
+        expensive one: it reads the transcript table and walks every row. Every
+        transcript is either given to a single cell outright or filed under the
+        tuple of cells that could claim it, and tuples not worth resolving --
+        one cell type between them, or an untyped member -- are marked to keep
+        their original assignment.
+
+        Nothing here depends on `default_thresh`: that only enters when a
+        candidate assignment is weighed against the original segmentation's
+        score. A sweep over `default_thresh` can therefore scan once and resolve
+        many times, which is what `SupportFuncs.ParamSweeper` does.
+
         f (int): current FOV
-        default_thresh (float): new segmentation must out-score original segmentation
-            by a factor of this much in order to be considered "better".
-        min_thresh (float): threshold to be used for confident transcript identification
+        gene_col_name (string): the gene/feature column of the transcript table.
+        min_thresh (float): threshold to be used for confident transcript identification.
+            Defaults to the value the validated vizgen run used; it is a share of
+            a transcript's total score, so it does not depend on the panel.
         only_tagged_cells (list): If provided, only cells in this list will be considered for re-evaluation.
-        use_conf_trs (bool): If true, confident transcripts will be added to each cell
-            when scoring transcript assignments. If false, only ambiguous transcripts will
-            be used. NOTE: Setting this to True causes a non-trivial slowdown.
-        assigned_col (string): The name of the column for the new assignment to be added to
-            for a given FOV's transcript table.
-        omit_blanks (bool): if True, all blanks will be categorically ignored. Note that you
+        use_other_cells (bool): if True, a tuple whose cells share one type is
+            still resolved, against a notional "other" cell; if False it keeps
+            its original assignment.
+        omit_blanks (bool): if True (the default, as in the validated vizgen run),
+            all blanks will be categorically ignored. Note that you
             may not want to ignore blanks in cell assignment if you want to quantify
             any kind of spatial error.
         auto_assign_single_target (bool): if True, unconfident transcripts that have a single
             eligible target cell will automatically be assigned to that cell.
-        disable_tqdm (bool): if True, this method will not print output or  create
+        disable_tqdm (bool): if True, this method will not print output or create
             its own pbar entities.
-        overwrite (bool): if True, this method will overwite assigned_col if it already exists.
-        """
-        if self.has_column(f, assigned_col) and not overwrite:
-            self.logger.info(
-                f"[{datetime.now()}] skipping fov_{f:0>4}, {assigned_col} already present"
-            )
-            return
 
-        # transcript id is the row label here: the scoring below addresses
-        # transcripts by it, and it is restored to a column before saving
+        returns: the state `resolve_overlapping_regions` consumes -- the
+           transcript table, the confident and ambiguous groupings, and the
+           tuples already settled -- or None when the FOV has no ambiguous
+           region to resolve. Also populates `self.tr_to_gene`, which
+           `score_tr_assignment` reads.
+        """
+        self.require_blurred(f)
+
+        # transcript id is the row label here: the scoring addresses transcripts
+        # by it, and it is restored to a column before saving
         tr = self.get_transcripts(f).set_index("index")
 
         self.logger.info(
-            f"[{datetime.now()}] evaluate_overlapping_regions starting fov_{f:0>4}..."
+            f"[{datetime.now()}] scanning transcripts for fov_{f:0>4}..."
         )
 
         conf_trs = {}  # key: cell, value: list of transcript ids
@@ -1655,7 +2538,9 @@ class SoftAssigner:
 
         seg_is_default = {}
         # key: unconf_tup
-        # value: True if using original masks, False if using novel mask
+        # value: True if using original masks, False if using novel mask.
+        # Always a plain bool -- `False` has to read as false, which a
+        # single-element list would not.
 
         assigned_trs = {}
         # key: cell
@@ -1671,15 +2556,26 @@ class SoftAssigner:
         else:
             pbar = None
 
-        for index, row in tr.iterrows():
+        # Walk the columns as arrays rather than with `iterrows`. Every row
+        # `iterrows` yields is a fresh Series, which pandas builds by copying the
+        # frame's metadata -- on a transcript table that is most of the loop's
+        # cost, and none of it is work this needs.
+        tr_index = tr.index.to_numpy()
+        tr_cell_ids = tr["cell_ids"].to_numpy()
+        tr_genes = tr[gene_col_name].to_numpy()
+
+        for i in range(len(tr_index)):
             if pbar is not None:
                 pbar.update(1)
 
+            index = tr_index[i]
+            gene = tr_genes[i]
+
             # omit blanks
-            if omit_blanks and "lank" in row[gene_col_name]:
+            if omit_blanks and "lank" in gene:
                 continue
 
-            assigned = ast.literal_eval(row["cell_ids"])
+            assigned = parse_cell_ids(tr_cell_ids[i])
 
             # skip over any transcript that has no possible cell assignments
             if len(assigned.keys()) == 0:
@@ -1693,7 +2589,7 @@ class SoftAssigner:
 
                 # try to assign to a single cell
                 conf_cell = self.assign_to_cell(assigned, min_thresh)
-                self.tr_to_gene[index] = row[gene_col_name]
+                self.tr_to_gene[index] = gene
                 if conf_cell is not None:
                     # transcript has confident assignment
                     if conf_cell in conf_trs.keys():
@@ -1730,7 +2626,7 @@ class SoftAssigner:
                         ]
                     ):
                         skip_cached.append(unconf_tup)
-                        seg_is_default[unconf_tup] = [True]
+                        seg_is_default[unconf_tup] = True
                         self.logger.info(
                             f"Throwing out tuple {unconf_tup}, contains untyped cell."
                         )
@@ -1761,18 +2657,22 @@ class SoftAssigner:
                             # treat this as an assigned transcript
                             # while not confident, there is no dispute about
                             # where this transcript belongs
+                            # float, as everywhere else in assigned_trs: the
+                            # ids that come back out of the (id, score) arrays
+                            # are floats, so keeping one type here means the
+                            # lookup built from this dict has one too
                             if unconf_tup[0] in assigned_trs.keys():
-                                assigned_trs[unconf_tup[0]].append(index)
+                                assigned_trs[unconf_tup[0]].append(float(index))
                             else:
-                                assigned_trs[unconf_tup[0]] = [index]
+                                assigned_trs[unconf_tup[0]] = [float(index)]
                             self.logger.info(
                                 f"Assigning transcript {index} to unconfident but unambiguous cell assignment {unconf_tup}."
                             )
-                            seg_is_default[unconf_tup] = [True]
+                            seg_is_default[unconf_tup] = True
                             continue
                         else:
                             skip_cached.append(unconf_tup)
-                            seg_is_default[unconf_tup] = [True]
+                            seg_is_default[unconf_tup] = True
                             self.logger.info(
                                 f"Throwing out tuple {unconf_tup}, contains single cell type."
                             )
@@ -1792,11 +2692,71 @@ class SoftAssigner:
 
         max_len = max([len(k) for k in unconf_trs.keys()])
 
+        return {
+            "fov": f,
+            "tr": tr,
+            "conf_trs": conf_trs,
+            "unconf_trs": unconf_trs,
+            "seg_is_default": seg_is_default,
+            "assigned_trs": assigned_trs,
+            "max_len": max_len,
+        }
+
+    def resolve_overlapping_regions(
+        self,
+        state,
+        default_thresh=5,
+        use_conf_trs=False,
+        use_other_cells=False,
+        use_mse_score=False,
+        disable_tqdm=False,
+    ):
+        """Choose each ambiguous region's best assignment, given a scan.
+
+        The second half of `evaluate_overlapping_regions_single_fov`. For each
+        ambiguous region a range of soft-score thresholds is swept to generate
+        candidate hard assignments, each scored with `score_tr_assignment`
+        against the matrix from `get_scoring_matrix`. Requires that matrix to
+        have been built.
+
+        `state` is left untouched, so one scan can be resolved at several
+        `default_thresh` values: the candidate scores do not depend on it, only
+        the margin a candidate has to clear before it displaces the original
+        segmentation.
+
+        state (dict): from `scan_overlapping_regions`.
+        default_thresh (float): new segmentation must out-score original segmentation
+            by a factor of this much in order to be considered "better".
+        use_conf_trs (bool): If true, confident transcripts will be added to each cell
+            when scoring transcript assignments. If false, only ambiguous transcripts will
+            be used. NOTE: Setting this to True causes a non-trivial slowdown.
+        use_other_cells (bool): if True, a one-cell region is compared against a
+            notional "other" cell rather than kept as-is.
+        use_mse_score (bool): if True, score an assignment by its squared error
+            against the cell type's expected profile instead of by summed score.
+        disable_tqdm (bool): if True, this method will not print output or create
+            its own pbar entities.
+
+        returns: (assigned_trs, seg_is_default)
+           assigned_trs: dict of cell id -> list of transcript IDs
+           seg_is_default: dict of region tuple -> True where the original
+              segmentation was kept
+        """
+        f = state["fov"]
+        tr = state["tr"]
+        conf_trs = state["conf_trs"]
+        unconf_trs = state["unconf_trs"]
+        max_len = state["max_len"]
+        # this method owns its copies, so the scan survives being resolved again
+        assigned_trs = {k: list(v) for k, v in state["assigned_trs"].items()}
+        seg_is_default = dict(state["seg_is_default"])
+
         if not disable_tqdm:
             print("\tassigning unconfident transcripts...")
             pbar = tqdm(total=len(unconf_trs))
         else:
             pbar = None
+
 
         # start with one way comparisons, then work our way up
         for cur_len in range(1, max_len + 1):
@@ -1873,7 +2833,10 @@ class SoftAssigner:
                     # with one possible cell assignment, we add a nonexistent "other"
                     # cell to compare against
                     if use_other_cells and cur_len == 1:
-                        tr_by_cell.update({"other": tr_by_cell[unconf_tup[0]]})
+                        # a local copy: the scan's own dict has to survive being
+                        # resolved again at another default_thresh
+                        tr_by_cell = dict(tr_by_cell)
+                        tr_by_cell["other"] = tr_by_cell[unconf_tup[0]]
                         elg_cells.append("other")
 
                     for thresh in np.arange(
@@ -1915,7 +2878,7 @@ class SoftAssigner:
                                         if k != "other"
                                     }
 
-                seg_is_default[unconf_tup] = best_score == -1
+                seg_is_default[unconf_tup] = bool(best_score == -1)
 
                 for cell, trs in best_assignment.items():
                     if len(trs) > 0 and cell != "other":
@@ -1944,8 +2907,20 @@ class SoftAssigner:
                                 assigned_trs[cell] = [float(t) for t in actual_trs]
         # print([k for k in unconf_trs.keys()])
 
+        if pbar is not None:
+            pbar.close()
+
         # assign things that were left as default
+        if not disable_tqdm:
+            print("\tapplying default assignments...")
+            pbar = tqdm(total=len(seg_is_default))
+        else:
+            pbar = None
+
         for unconf_tup, is_default in seg_is_default.items():
+            if pbar is not None:
+                pbar.update(1)
+
             if is_default:
                 if unconf_tup in unconf_trs:
                     og_assignment = self.trs_at_default(unconf_trs[unconf_tup])
@@ -1953,14 +2928,138 @@ class SoftAssigner:
                         # "other" assignments were for one-way comparisons
                         if cell != "other":
                             if cell in assigned_trs:
-                                assigned_trs[cell].extend(trs)
+                                assigned_trs[cell].extend(float(t) for t in trs)
                             else:
-                                assigned_trs[cell] = trs
+                                assigned_trs[cell] = [float(t) for t in trs]
                 else:
                     print(f"{unconf_tup} does not have corresponding trs list")
 
+
         if pbar is not None:
             pbar.close()
+
+        return assigned_trs, seg_is_default
+
+    def evaluate_overlapping_regions_single_fov(
+        self,
+        f,
+        gene_col_name="gene",
+        min_thresh=0.7,
+        default_thresh=5,
+        only_tagged_cells=None,
+        use_conf_trs=False,
+        use_other_cells=False,
+        use_mse_score=False,
+        assigned_col="assignment",
+        omit_blanks=True,
+        auto_assign_single_target=False,
+        save_delta_tallies=False,
+        disable_tqdm=False,
+        overwrite=False,
+        save=True,
+        recompute_og=False,
+        scan_state=None,
+        defer_region_tables=False,
+    ):
+        """
+        Scores and re-assigns border region transcripts for a single FOV.
+
+        Composes `scan_overlapping_regions` (sort the transcripts) and
+        `resolve_overlapping_regions` (pick each ambiguous region's best
+        assignment), then writes the result to the FOV's transcript table as
+        `assigned_col`, alongside `og_cell`, `og_type` and
+        `f"{assigned_col}_type"`. Pass `scan_state` to reuse a scan rather than
+        repeating it.
+
+        f (int): current FOV
+        gene_col_name (string): the gene/feature column of the transcript table.
+        default_thresh (float): new segmentation must out-score original segmentation
+            by a factor of this much in order to be considered "better".
+        min_thresh (float): threshold to be used for confident transcript identification.
+            Defaults to the value the validated vizgen run used; it is a share of
+            a transcript's total score, so it does not depend on the panel.
+        only_tagged_cells (list): If provided, only cells in this list will be considered for re-evaluation.
+        use_conf_trs (bool): If true, confident transcripts will be added to each cell
+            when scoring transcript assignments. If false, only ambiguous transcripts will
+            be used. NOTE: Setting this to True causes a non-trivial slowdown.
+        assigned_col (string): The name of the column for the new assignment to be added to
+            for a given FOV's transcript table.
+        omit_blanks (bool): if True (the default, as in the validated vizgen run),
+            all blanks will be categorically ignored. Note that you
+            may not want to ignore blanks in cell assignment if you want to quantify
+            any kind of spatial error.
+        auto_assign_single_target (bool): if True, unconfident transcripts that have a single
+            eligible target cell will automatically be assigned to that cell.
+        disable_tqdm (bool): if True, this method will not print output or  create
+            its own pbar entities.
+        overwrite (bool): if True, this method will overwite assigned_col if it already exists.
+        use_other_cells (bool): if True, a region whose cells share one type is
+            still resolved, against a notional "other" cell.
+        use_mse_score (bool): if True, score an assignment by its squared error
+            against the cell type's expected profile instead of by summed score.
+        save_delta_tallies (bool): if True, per-cell gained/lost/changed/final
+            counts are stored as a `f"{fov}_deltas_{assigned_col}"` table.
+        save (bool): if True (default) the transcript table is written back to
+            the store. False leaves the edit in memory, for a caller making many
+            successive assignments -- see `SupportFuncs.ParamSweeper`.
+        recompute_og (bool): og_cell and og_type follow from `cell_ids` and the
+            scoring matrix's cell types, not from either threshold, so an
+            existing pair is reused. `blur_fov` drops them when it rewrites
+            `cell_ids`; set this to rebuild them after changing the cell types
+            under an already-used scoring matrix.
+        scan_state (dict): a scan from `scan_overlapping_regions` to resolve,
+            instead of scanning this FOV again. Must have been taken at the same
+            `min_thresh`, which is what a scan depends on.
+        defer_region_tables (bool): if True, this FOV's rows for the
+            `assigned_trs`/`seg_is_default` tables are returned instead of being
+            merged into them here. Those tables cover every FOV, so a runner
+            merges them once rather than having each FOV rewrite the element --
+            see `evaluate_all_overlapping_regions`.
+
+        writes: `assigned_col`, `og_cell`, `og_type` and `f"{assigned_col}_type"`
+           on the FOV's points element, and this FOV's rows of the
+           `f"assigned_trs_{assigned_col}"` and
+           `f"seg_is_default_{assigned_col}"` tables, which record how those
+           assignments were reached. Saved unless `save` is False.
+        """
+        if self.has_column(f, assigned_col) and not overwrite:
+            self.logger.info(
+                f"[{datetime.now()}] skipping fov_{f:0>4}, {assigned_col} already present"
+            )
+            if not disable_tqdm:
+                print(f"fov_({f:0>4}) already present, skipping")
+            return
+
+        if scan_state is None:
+            scan_state = self.scan_overlapping_regions(
+                f,
+                gene_col_name=gene_col_name,
+                min_thresh=min_thresh,
+                only_tagged_cells=only_tagged_cells,
+                use_other_cells=use_other_cells,
+                omit_blanks=omit_blanks,
+                auto_assign_single_target=auto_assign_single_target,
+                disable_tqdm=disable_tqdm,
+            )
+        if scan_state is None:
+            return
+
+        tr = scan_state["tr"]
+        conf_trs = scan_state["conf_trs"]
+        assigned_trs, seg_is_default = self.resolve_overlapping_regions(
+            scan_state,
+            default_thresh=default_thresh,
+            use_conf_trs=use_conf_trs,
+            use_other_cells=use_other_cells,
+            use_mse_score=use_mse_score,
+            disable_tqdm=disable_tqdm,
+        )
+
+        table_rows = self.region_rows(f, assigned_trs, seg_is_default)
+        if not defer_region_tables:
+            self.save_region_tables(
+                {f: table_rows}, assigned_col, overwrite=overwrite, save=save
+            )
 
         self.logger.info(f"[{datetime.now()}] updating tr for fov_{f:0>4}")
 
@@ -1981,56 +3080,72 @@ class SoftAssigner:
                 for k, v in d.items()
             }
         )
-        # create new column for tr dataframe where row is transcript ID and value is cell assignment
-        new_col = tr.apply(
-            lambda b: (
-                inv_assignment[b.name] if b.name in inv_assignment.keys() else np.nan
-            ),
-            axis=1,
-        )
-        tr[assigned_col] = new_col
+        # These four columns were row-wise `.apply(axis=1)` passes, which build a
+        # Series per transcript. Three of them are pure lookups and vectorise; the
+        # fourth has to run python per row, but over the one column it reads
+        # rather than over whole rows.
+        #
+        # All four are `MISSING_DTYPE` ("string"), and a transcript with no cell
+        # or no type is `MISSING` (`pd.NA`) in every one of them -- see
+        # `as_label_column`.
 
-        # adding some simple tracking columns to make later analysis easier
-        tr["og_cell"] = tr.apply(
-            lambda b: (
-                str(int(self.assign_to_cell(ast.literal_eval(b["cell_ids"]))))
-                if b["cell_ids"] is not None
-                and self.assign_to_cell(ast.literal_eval(b["cell_ids"])) is not None
-                else "None"
-            ),
-            axis=1,
-        )
-        tr["og_type"] = tr.apply(
-            lambda b: (
-                self.cell_to_type[b["og_cell"]]
-                if b["og_cell"] in self.cell_to_type
-                else "None"
-            ),
-            axis=1,
-        )
-        tr[f"{assigned_col}_type"] = tr.apply(
-            lambda b: (
-                self.cell_to_type[b[assigned_col]]
-                if b[assigned_col] in self.cell_to_type
-                else "None"
-            ),
-            axis=1,
+        # transcript ID -> cell. The ids arrive as a mix of ints and floats
+        # (confident assignments keep the index dtype, reassigned ones are cast
+        # to float), so both sides are matched as floats.
+        if inv_assignment:
+            lookup = pd.Series(inv_assignment)
+            lookup.index = lookup.index.astype(float)
+            values = lookup.reindex(tr.index.to_numpy(dtype=float)).to_numpy()
+        else:
+            values = None
+        tr[assigned_col] = self.as_label_column(values, tr.index)
+
+        # Adding some simple tracking columns to make later analysis easier.
+        # `og_cell` and `og_type` describe the segmentation this run started
+        # from: they follow from `cell_ids` and the scoring matrix's cell types,
+        # and not from either threshold. Re-running with different thresholds
+        # therefore recomputes the same answer, so an existing pair is left
+        # alone. `blur_fov` drops them when it rewrites `cell_ids`; pass
+        # `recompute_og=True` after changing the cell types under a scoring
+        # matrix that has already been used.
+        if recompute_og or "og_cell" not in tr.columns:
+            og_cell = []
+            for raw in tr["cell_ids"].to_numpy():
+                cell = None if raw is None else self.assign_to_cell(parse_cell_ids(raw))
+                og_cell.append(MISSING if cell is None else str(int(cell)))
+            tr["og_cell"] = self.as_label_column(og_cell, tr.index)
+        else:
+            self.logger.debug(
+                f"fov_{f:0>4}: reusing the og_cell column already on the table."
+            )
+
+        if recompute_og or "og_type" not in tr.columns:
+            tr["og_type"] = self.as_label_column(
+                tr["og_cell"].map(self.cell_to_type), tr.index
+            )
+
+        tr[f"{assigned_col}_type"] = self.as_label_column(
+            tr[assigned_col].map(self.cell_to_type), tr.index
         )
 
         # tally deltas while the table is still addressed by transcript id
         if save_delta_tallies:
             deltas = {}
             final_trs = {}
-            for c in tr[assigned_col].astype("category").cat.categories:
-                ex = tr[tr[assigned_col] == c].index
-                final_trs[str(int(c))] = list(ex)
+            # compared as a plain object array: `assigned_col` is nullable, and
+            # `== c` on it yields NA wherever a transcript went unassigned, which
+            # is not something a row mask accepts
+            labels = tr[assigned_col].to_numpy(dtype=object, na_value=None)
+            named = labels[pd.notna(labels)]
+            for c in pd.unique(named):
+                final_trs[str(int(c))] = list(tr.index[labels == c])
 
             for cell, trs in assigned_trs.items():
                 if cell not in deltas.keys():
                     deltas[cell] = [0, 0, 0, 0]
 
                 for trid in trs:
-                    original = ast.literal_eval(tr.loc[[trid]]["cell_ids"].values[0])
+                    original = parse_cell_ids(tr.loc[[trid]]["cell_ids"].values[0])
                     original = self.assign_to_cell(original)
 
                     if original != str(cell):
@@ -2056,11 +3171,16 @@ class SoftAssigner:
             tally.obs_names = [str(c) for c in cells]
             tally.var_names = ["gained", "lost", "changed", "final"]
             tally.obs["cell_id"] = cells
-            self.save_table(f"{f}_deltas_{assigned_col}", tally)
+            self.save_table(f"{f}_deltas_{assigned_col}", tally, save=save)
 
         # last bit of cleanup before we save it:
         tr = tr.loc[:, ~tr.columns.str.contains("^Unnamed")]
-        self.set_transcripts(f, tr.reset_index())
+        self.set_transcripts(f, tr.reset_index(), save=save)
+
+        # the rows are the compact form of these dicts, so a deferred run hands
+        # those back rather than the dicts themselves
+        if defer_region_tables:
+            return (f, *table_rows)
 
         # this is too big to keep in memory if we're a part of a pool
         # that's running everything. So, delete if we are in a pool.
@@ -2111,9 +3231,17 @@ class SoftAssigner:
 
         A worker returns its results by saving its own FOV's element back to the
         store; with nowhere to save, the work would be done and then lost when
-        the process exits. There are two ways to be in that position, and they
+        the process exits. There are three ways to be in that position, and they
         need different fixes.
         """
+        if not self.save_to_disk:
+            raise ValueError(
+                "Cannot run in parallel with save_to_disk=False: a worker hands "
+                "its results back by saving its own FOV's element, so with "
+                "writing turned off every FOV's output would be lost. Build the "
+                "SoftAssigner with save_to_disk=True, or set pool_size=1 to work "
+                "in memory."
+            )
         if self._sdata_path is None:
             raise ValueError(
                 "This SpatialData has never been saved, so worker processes "
@@ -2133,7 +3261,7 @@ class SoftAssigner:
                 "pool_size=1."
             )
 
-    def _run_over_fovs(self, tasks, total, processes):
+    def _run_over_fovs(self, tasks, total, processes, collect=False):
         """Run `(func, *args)` tasks, in a worker pool or serially, with a pbar.
 
         `processes <= 1` skips multiprocessing entirely, which keeps single-
@@ -2145,40 +3273,64 @@ class SoftAssigner:
         store, so a parallel run requires one: see `_check_parallel_allowed`.
         Afterwards the store is re-read, since the elements the workers rewrote
         are newer than the ones held here.
+
+        `collect` gathers what each task returned, for the one result a worker
+        cannot save itself: rows of a table shared by every FOV. It is off by
+        default because most of these tasks hand back the FOV's whole transcript
+        table, which there is no reason to keep once it has been saved.
         """
         if processes > 1:
             self._check_parallel_allowed()
 
+        results = []
         with tqdm(total=total) as pbar:
             if processes <= 1:
                 for task in tasks:
-                    task[0](self, *task[1:])
+                    result = task[0](self, *task[1:])
+                    if collect:
+                        results.append(result)
                     pbar.update(1)
-                return
+                return results
             with closing(self._pool(processes)) as pool:
-                for _ in pool.imap_unordered(_run_worker, tasks):
+                for result in pool.imap_unordered(_run_worker, tasks):
+                    if collect:
+                        results.append(result)
                     pbar.update(1)
         self._reload_sdata()
+        return results
 
     def evaluate_all_overlapping_regions(
         self,
         sel_fovs=None,
         gene_col_name="gene",
-        min_thresh=None,
+        min_thresh=0.7,
         default_thresh=5,
         only_tagged_cells=None,
         use_conf_trs=False,
         use_other_cells=False,
         use_mse_score=False,
         assigned_col="assignment",
-        omit_blanks=False,
+        omit_blanks=True,
         auto_assign_single_target=False,
         save_delta_tallies=False,
         overwrite=False,
+        recompute_og=False,
     ):
         """
-        Runner for evaluate_overlapping_regions_single
+        Runner for evaluate_overlapping_regions_single_fov.
         Runs said method in parallel on multiple fovs.
+
+        Every argument bar `sel_fovs` is passed straight through; see that
+        method for what each does. Each worker scans and resolves its own FOV
+        and saves its own element, so this always writes -- the deferred `save`
+        that a sweep uses is not available here. The `assigned_trs` and
+        `seg_is_default` tables cover every FOV at once, so they are merged and
+        written here, after the workers have finished.
+
+        sel_fovs (list): FOVs to run on. Defaults to every FOV whose transcript
+           table has been through `blur_fov`.
+        recompute_og (bool): rebuild og_cell/og_type rather than reusing an
+           existing pair.
         """
         if sel_fovs is None:
             sel_fovs = self.get_complete_fovs()
@@ -2195,9 +3347,10 @@ class SoftAssigner:
 
         self.logger.info(f"Pooling fovs for parallel processing, as:\n{fov_pool}")
 
+        results = []
         for subset_fovs in fov_pool:
             self.logger.info(f"[{datetime.now()}] starting sub-pool: {subset_fovs}")
-            self._run_over_fovs(
+            results.extend(self._run_over_fovs(
                 zip(
                     repeat(SoftAssigner.evaluate_overlapping_regions_single_fov),
                     subset_fovs,
@@ -2214,10 +3367,23 @@ class SoftAssigner:
                     repeat(save_delta_tallies),
                     repeat(True),
                     repeat(overwrite),
+                    repeat(True),  # save: each worker persists its own element
+                    repeat(recompute_og),
+                    repeat(None),  # scan_state: each worker scans its own FOV
+                    repeat(True),  # defer_region_tables: merged below, once
                 ),
                 len(subset_fovs),
                 min(self.pool_size, len(subset_fovs)),
-            )
+                collect=True,
+            ))
+
+        # the assigned_trs/seg_is_default tables span every FOV, so they are
+        # written here rather than by each FOV: a worker holds its own copy of
+        # the store, and several of them rewriting one element would leave only
+        # whichever finished last. FOVs that were skipped return nothing.
+        rows = {f: (trs, seg) for f, trs, seg in (r for r in results if r is not None)}
+        if rows:
+            self.save_region_tables(rows, assigned_col, overwrite=overwrite)
 
     def combined_changed_transcripts(
         self, assigned_col="assignment", gene_col_name="gene"

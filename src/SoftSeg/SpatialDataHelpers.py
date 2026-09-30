@@ -22,11 +22,13 @@ should use the standard readers (``spatialdata_io.cosmx``, ``xenium``, ...).
 
 from __future__ import annotations
 
+import logging
 import multiprocessing as mp
 import os
 import re
 import threading
 import warnings
+from contextlib import contextmanager
 from typing import Any, Mapping, Optional, Sequence, Union
 
 import anndata as ad
@@ -65,6 +67,37 @@ class SpatialDataHelpers:
 
     # Key under which this package's own bookkeeping lives in SpatialData.attrs.
     SOFTSEG_ATTRS = "softseg"
+
+    # ome-zarr-py logs one of these per labels element on every read of a store
+    # written by spatialdata; see quiet_ome_zarr.
+    OME_ZARR_NOISE = "no parent found for"
+
+    @staticmethod
+    def quiet_ome_zarr():
+        """Drop ome-zarr-py's "no parent found for ..." records.
+
+        spatialdata writes a labels element without the image it would be a
+        label *of*, which ome-zarr-py logs a warning about every time it reads
+        one. A per-FOV store has hundreds of labels elements, so opening one
+        buries the session in hundreds of lines about a layout SoftSeg uses
+        deliberately. https://github.com/scverse/spatialdata/issues/400
+
+        Only that one message goes, and only from the logger that emits it, so
+        anything else ome-zarr has to say about a store still comes through --
+        silencing the whole logger would hide a real problem reading one.
+        Installed once: calling this again does not stack another filter.
+        """
+        logger = logging.getLogger("ome_zarr.reader")
+        if any(getattr(f, "_softseg_filter", False) for f in logger.filters):
+            return
+
+        def drop_no_parent(record):
+            return not record.getMessage().startswith(
+                SpatialDataHelpers.OME_ZARR_NOISE
+            )
+
+        drop_no_parent._softseg_filter = True
+        logger.addFilter(drop_no_parent)
 
     @staticmethod
     def _element_fov_cs(element) -> Optional[str]:
@@ -109,8 +142,37 @@ class SpatialDataHelpers:
             sdata.delete_element_from_disk(name)
         except (ValueError, KeyError):
             pass  # not on disk yet: this is the element's first write
-        sdata.write_element(name)
+        with SpatialDataHelpers._write_settings():
+            sdata.write_element(name)
         return True
+
+    # anndata's `auto_shard_zarr_v3` is tri-state: left as None it warns on every
+    # table written to a zarr v3 store, because sharding is about to become the
+    # default. We opt in rather than carry the warning -- measured at no change
+    # to read or write time, 0.1% larger on a cell-by-gene table and a couple of
+    # KB on the small bookkeeping ones -- and only around our own writes, so the
+    # setting does not leak into the rest of the session.
+    AUTO_SHARD_ZARR_V3 = True
+
+    @staticmethod
+    @contextmanager
+    def _write_settings():
+        """anndata's zarr settings, for the duration of one of our writes.
+
+        A no-op on an anndata too old to have the setting.
+        """
+        key = "auto_shard_zarr_v3"
+        settings = getattr(ad, "settings", None)
+        if settings is None or not hasattr(settings, key):
+            yield
+            return
+
+        previous = getattr(settings, key)
+        setattr(settings, key, SpatialDataHelpers.AUTO_SHARD_ZARR_V3)
+        try:
+            yield
+        finally:
+            setattr(settings, key, previous)
 
     @staticmethod
     def remove_element(sdata: SpatialData, name: str) -> bool:
@@ -795,7 +857,7 @@ class SpatialDataHelpers:
            masks, and this function only ever sees the part of it inside ``by``'s FOV
            -- so its counts are that FOV's share, not the whole cell's. To recover
            whole-cell counts (what
-           :meth:`~SoftSeg.SoftAssigner.SoftAssigner.convert_to_adata` produces, since
+           :meth:`~SoftSeg.SoftAssigner.SoftAssigner.generate_cxg_table` produces, since
            it tallies across every FOV), aggregate each FOV separately and pool the
            resulting tables by ``cell_id``.
 

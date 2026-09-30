@@ -16,7 +16,7 @@ packages = ["src/SoftSeg"]
 
 [project]
 name = "SoftSeg"
-version = "0.3.0"
+version = "0.3.1"
 authors = [
   { name="Cecilia Cisar", email="ccisar@ucsc.edu" },
 ]
@@ -47,6 +47,8 @@ dependencies = [
     # vectorised shapely.distance / shapely.contains_xy
     "shapely>=2.0",
     "scikit-image",
+    # ndimage.find_objects, for per-cell contouring in SegImagePlotter
+    "scipy",
     # delete_element_from_disk, get_centroids, SpatialData.is_backed
     "spatialdata>=0.5",
     "tifffile",
@@ -59,6 +61,11 @@ dependencies = [
 neighbors = [
     "scikit-learn",
     "torch",
+]
+# SegImagePlotter renders through spatialdata-plot; it is imported lazily, so
+# the rest of the package works without it.
+plotting = [
+    "spatialdata-plot",
 ]
 test = [
     "pytest",
