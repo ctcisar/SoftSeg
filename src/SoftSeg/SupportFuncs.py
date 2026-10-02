@@ -2,7 +2,8 @@ import ast
 import collections
 import fnmatch
 import glob
-import logging
+import inspect
+import itertools
 import random
 import re
 import warnings
@@ -26,14 +27,15 @@ import spatialdata as sd
 import tifffile
 from spatialdata import SpatialData, read_zarr
 from spatialdata.models import (Image2DModel, Image3DModel, Labels2DModel,
-                                Labels3DModel, PointsModel, ShapesModel,
-                                TableModel)
+                                Labels3DModel, PointsModel, ShapesModel)
 from spatialdata.transformations import (Affine, Identity, Sequence,
                                          Translation, get_transformation)
 from tqdm.auto import tqdm
 
-from SoftSeg.SoftAssigner import SoftAssigner, parse_cell_ids
+from SoftSeg.SoftAssigner import (RegionEvalParams, SoftAssigner,
+                                  parse_cell_ids)
 from SoftSeg.SpatialDataHelpers import SpatialDataHelpers
+from SoftSeg.scoring import SCORING_METHODS
 from SoftSeg.warp_shapes import smooth_field_warp, warp_shapes
 
 
@@ -407,7 +409,9 @@ class SegImagePlotter:
         fov: the FOV to draw; may also be chosen later with `load_fov`.
         """
         SpatialDataHelpers.quiet_ome_zarr()
-        self.sdata = sd.read_zarr(sdata) if isinstance(sdata, (str, Path)) else sdata
+        if isinstance(sdata, (str, Path)):
+            sdata = SpatialDataHelpers.open_store(sdata)
+        self.sdata = sdata
         self.fov = None
         self.exposure_eq = exposure_eq
         if fov is not None:
@@ -750,7 +754,9 @@ class SegImagePlotter:
         el = self.sdata.images[self.image_key]
         dims = el.dims
         arr = np.asarray(
-            el.transpose("c", "z", "y", "x") if "z" in dims else el.transpose("c", "y", "x")
+            el.transpose("c", "z", "y", "x")
+            if "z" in dims
+            else el.transpose("c", "y", "x")
         ).astype(float)
         if arr.ndim == 3:
             arr = arr[:, None, ...]
@@ -781,8 +787,14 @@ class SegImagePlotter:
         n_z, n_rows, n_cols = masks.shape
         return (
             list(range(int(zs.min()), int(zs.max()) + 1)),
-            slice(max(int(rows.min()) - border, 0), min(int(rows.max()) + border, n_rows)),
-            slice(max(int(cols.min()) - border, 0), min(int(cols.max()) + border, n_cols)),
+            slice(
+                max(int(rows.min()) - border, 0),
+                min(int(rows.max()) + border, n_rows),
+            ),
+            slice(
+                max(int(cols.min()) - border, 0),
+                min(int(cols.max()) + border, n_cols),
+            ),
         )
 
     def outline_groups(self, mask_values, highlight_cells=None, adata=None,
@@ -1056,9 +1068,11 @@ class SegImagePlotter:
         target_cell: if provided, will zoom in on that cell specifically, and
            highlight it in red alongside `highlight_cells`
         highlight_cells: cell ids listed will be highlighted in red
-        adata: anndata with cell ids and other information. Only needed for highlight_types
+        adata: anndata with cell ids and other information. Only needed for
+           highlight_types
         highlight_type: cells that match this type will be highlighted in white
-        single_channel: if provided, only this channel of the segmentation image will be usd
+        single_channel: if provided, only this channel of the segmentation image
+           will be used
         transcripts: transcripts to draw over the segmentation. Give it the name
            of an assignment column -- "first_try", say -- and what it draws
            depends on whether anything is in focus: with a `target_cell` or
@@ -1215,7 +1229,9 @@ class UnitTestWarper:
         """
 
         SpatialDataHelpers.quiet_ome_zarr()
-        self.sdata = sd.read_zarr(sdata) if isinstance(sdata, (str, Path)) else sdata
+        if isinstance(sdata, (str, Path)):
+            sdata = SpatialDataHelpers.open_store(sdata)
+        self.sdata = sdata
         self.fov = fov
         self.labels = labels
         warnings.filterwarnings(
@@ -1413,12 +1429,14 @@ class ParamSweeper:
     """Sweeps `SoftAssigner` parameters over one SpatialData.
 
     Every run works on the same object, so the sweep's bookkeeping is done with
-    column names rather than with separate output directories: blurring
-    overwrites the `cell_ids` column each time, and each assignment is written to
-    a column named after the **full** parameter set that produced it
-    (`assigned_size25_dist3.5_default10_min0.8`). The sdata therefore keeps one
-    distinguishable column per combination tried, alongside the transcript table
-    it came from.
+    columns rather than with separate output directories: blurring overwrites
+    the `cell_ids` column each time, and each assignment is written to a column
+    of its own, named after its scoring method and numbered
+    (`additive_matrix_1`, `additive_matrix_2`, ...). What produced a column is
+    not in its name but in the sdata, `attrs["scoring"][column]` -- the
+    evaluation's arguments, the scoring method's and the blur it read -- so the
+    name only has to be unique. The sdata keeps one column per combination
+    tried, alongside the transcript table it came from.
 
     The FOVs to sweep default to every FOV in the object, which for the unit-test
     datasets this is aimed at is a single one.
@@ -1435,20 +1453,48 @@ class ParamSweeper:
                 "No FOVs found in this SpatialData: expected paired "
                 "'{fov}_labels' and '{fov}_points' elements."
             )
-        # set by blur_fovs, so an assignment column can name the blur that fed it
+        # set by blur_fovs: the blur the current `cell_ids` came from
         self.blur_params = None
+        # column names `column_name` has handed out in this session
+        self._issued = set()
 
     @property
     def sdata(self):
         return self.asgn.sdata
 
-    def param_name(self, default_thresh, min_thresh):
-        """Column name for one point in the sweep, blur parameters included."""
-        name = ""
-        if self.blur_params is not None:
-            min_size, max_dist = self.blur_params
-            name += f"size{min_size}_dist{max_dist}_"
-        return f"assigned_{name}default{default_thresh}_min{min_thresh}"
+    def column_name(self, method=None):
+        """The next free column for an assignment scored by `method`.
+
+        `{method}_{n}`, with the method's spaces as underscores and `n` one past
+        the highest already used for that method -- in the swept FOVs'
+        transcript tables or in the attrs record -- so a second sweep adds
+        columns rather than overwriting the first's. The parameters that
+        produced a column are in `attrs["scoring"][column]`, which is what makes
+        a bare number enough.
+
+        method: a scoring method's name; None takes the one in force, or the
+            default.
+        """
+        if method is None:
+            scorer = self.asgn.scorer
+            method = scorer.name if scorer is not None else (
+                SoftAssigner.DEFAULT_SCORING_METHOD
+            )
+        stem = re.sub(r"\W+", "_", str(method)).strip("_")
+        pattern = re.compile(rf"^{re.escape(stem)}_(\d+)$")
+
+        used = set(self.asgn.scoring_params())
+        for fov in self.fovs:
+            key = self.asgn._points_key(fov)
+            if key in self.sdata.points:
+                used.update(self.sdata.points[key].columns)
+        used.update(self._issued)
+        taken = [int(m.group(1)) for m in map(pattern.match, used) if m]
+        name = f"{stem}_{max(taken, default=0) + 1}"
+        # remembered, so names handed out before anything is written are not
+        # handed out twice
+        self._issued.add(name)
+        return name
 
     def blur_fovs(self, min_size=25, max_dist=3.5, save=True):
         """Re-blur every swept FOV.
@@ -1463,31 +1509,102 @@ class ParamSweeper:
             min_size, max_dist, sel_fovs=self.fovs, save=save
         )
 
-    def process_unit_test(self, table_name, cats=None):
-        """Build the scoring matrix from a cell-typed reference table.
+    def unit_test_table(self, table_name):
+        """A simulated dataset's reference table, in the shape scoring wants.
 
-        `table_name` names a table in the sdata -- where `generate_cxg_table` and
-        `CellTypeAssigner` leave their results.
+        The simulation's counts table is sparse and indexed by cell name; the
+        scoring matrix wants a dense X and a positional index. Fixing it does
+        not depend on any swept parameter, so a sweep does this once rather than
+        per point.
         """
         adata = self.sdata.tables[table_name]
-
-        if cats is None:
-            cats = {"celltype": ["ct_0", "ct_1"]}
-
         if hasattr(adata.X, "todense"):
             adata.X = adata.X.todense()
         adata.obs.index = [str(x) for x in range(len(adata))]
         adata.obs["instance_id"] = [f"cell_{x}" for x in range(len(adata))]
+        return adata
+
+    def process_unit_test(self, table_name, cats=None):
+        """Build the scoring reference from a cell-typed reference table.
+
+        `table_name` names a table in the sdata -- where `generate_cxg_table` and
+        `CellTypeAssigner` leave their results. Kept for callers written against
+        it; `prepare_scoring` is the general form, which can build any
+        registered scoring method rather than only the matrix one.
+        """
+        if cats is None:
+            cats = {"celltype": ["ct_0", "ct_1"]}
         # QC bounds, if this dataset records any, come from its own attrs
-        self.asgn.get_scoring_matrix(adata, cats, normed=False)
+        self.prepare_scoring(
+            adata=self.unit_test_table(table_name), cats=cats, normed=False
+        )
 
-    def scan(self, gene_col_name, min_thresh, **kwargs):
-        """Scan every swept FOV once, for reuse across `default_thresh` values.
+    #: Name an `adata` handed to the sweep is stored under, in memory only,
+    #: when it is not already one of the sdata's tables -- scoring reads its
+    #: table by name, which is what lets the choice travel through the
+    #: evaluate methods' `scoring_params`.
+    REFERENCE_TABLE = "sweep_reference"
 
-        Sorting transcripts into confident and ambiguous is the expensive part of
-        an assignment and depends on `min_thresh`, not on `default_thresh`, so a
-        sweep over the latter scans once and resolves repeatedly. Returns
-        `{fov: scan_state}` to hand back to `assign`.
+    def _reference_table(self, adata=None, table_name=None):
+        """The table name a sweep's scoring should read, for `scoring_params`.
+
+        An `adata` that is one of the sdata's tables is named by its key. Any
+        other is put into the sdata in memory as `REFERENCE_TABLE` -- never
+        saved, since nothing a sweep writes is a table.
+        """
+        if adata is None:
+            return table_name
+        for name in list(self.sdata.tables.data):  # loaded ones; adata is
+            if self.sdata.tables[name] is adata:   # in memory if it is one
+                return name
+        self.sdata.tables[self.REFERENCE_TABLE] = adata
+        return self.REFERENCE_TABLE
+
+    def scoring_request(self, score_point, table_name=None):
+        """`(scoring_method, scoring_params)` for one sweep point.
+
+        What every evaluate call of the point is handed, so the method is
+        chosen through the evaluate methods' own arguments. A point that names
+        no method takes the default, as `set_scoring_method` does. `table_name`
+        joins the parameters for a method that takes one and was not given one.
+        """
+        method = score_point.get("method") or SoftAssigner.DEFAULT_SCORING_METHOD
+        params = {k: v for k, v in score_point.items() if k != "method"}
+        if (table_name is not None and "table_name" not in params
+                and self.method_takes(method, "table_name")):
+            params["table_name"] = table_name
+        return method, params
+
+    def prepare_scoring(self, method=None, adata=None, table_name=None, **params):
+        """Choose and prepare a scoring method for the next sweep points.
+
+        method (string): a key of `SoftAssigner.scoring_methods()`. None takes
+            the default, which is "additive matrix".
+        params: whatever that method takes -- they differ by method, which is
+            why a sweep over scoring is a sweep over `{name: [values]}` rather
+            than over a fixed set of flags.
+        adata / table_name: the table to prepare from, if the method reads one.
+
+        Goes through `SoftAssigner.use_scoring`, the same path the evaluate
+        methods' `scoring_method`/`scoring_params` take, so the evaluate calls
+        that follow with the same request find it prepared rather than
+        preparing again. Never writes to the store.
+        """
+        method, params = self.scoring_request(
+            {"method": method, **params}, self._reference_table(adata, table_name)
+        )
+        return self.asgn.use_scoring(method, params, save=False)
+
+    def scan(self, gene_col_name="gene", min_thresh=0.8, **kwargs):
+        """Scan every swept FOV once, for reuse across the parameters it does
+        not depend on.
+
+        Sorting transcripts into confident and ambiguous is the expensive part
+        of an assignment, and it depends only on `RegionEvalParams.SCAN_KEYS` --
+        `min_thresh` and friends -- not on `default_thresh`. A sweep scans once
+        per combination of those and resolves repeatedly underneath, which is
+        what `sweep` orders its loops around. Returns `{fov: scan_state}` to
+        hand back to `assign`.
         """
         scans = {}
         for fov in self.fovs:
@@ -1502,29 +1619,46 @@ class ParamSweeper:
                 scans[fov] = state
         return scans
 
-    def assign(self, gene_col_name, default_thresh=10, min_thresh=0.8, save=True,
-               scans=None):
-        """Evaluate overlapping regions for this parameter set.
+    def assign(self, gene_col_name="gene", default_thresh=10, min_thresh=0.8,
+               save=True, scans=None, name=None, scoring_method=None,
+               scoring_params=None, **eval_params):
+        """Evaluate overlapping regions for one point of a sweep.
 
         Returns the name of the column written, which is also where the result
         now lives in the sdata. `save=False` keeps the edit in memory; see
-        `save_transcripts`. Pass `scans` from `scan` to reuse a scan taken at the
-        same `min_thresh` rather than repeating it.
+        `save_transcripts`. Pass `scans` from `scan` to reuse a scan taken at
+        the same scan parameters rather than repeating it.
+
+        name (string): the column to write. None takes the next free one for
+            the scoring method in force (`column_name`).
+        scoring_method / scoring_params: the scoring to evaluate with, handed
+            to every evaluate call as is (see `SoftAssigner.use_scoring`). None
+            uses the method in force.
+        eval_params: any other `RegionEvalParams` field -- `use_other_cells`,
+            `omit_blanks`, `only_tagged_cells` and the rest -- so a sweep is not
+            limited to the two thresholds.
         """
-        name = self.param_name(default_thresh, min_thresh)
+        if name is None:
+            name = self.column_name(scoring_method)
         for fov in self.fovs:
             if scans is not None and fov not in scans:
                 continue  # nothing ambiguous in this FOV
+            # a sweep is a batch run in all but one respect: it is quiet and it
+            # keeps its own region-table rows per FOV, but it may be deferring
+            # its writes, which `save` says and `batch` does not override
             self.asgn.evaluate_overlapping_regions_single_fov(
                 fov,
+                batch=True,
+                save=save,
+                scan_state=None if scans is None else scans[fov],
                 assigned_col=name,
                 gene_col_name=gene_col_name,
                 default_thresh=default_thresh,
                 min_thresh=min_thresh,
-                disable_tqdm=True,
                 overwrite=True,
-                save=save,
-                scan_state=None if scans is None else scans[fov],
+                scoring_method=scoring_method,
+                scoring_params=scoring_params,
+                **eval_params,
             )
 
         return name
@@ -1604,6 +1738,200 @@ class ParamSweeper:
 
         return type_hits / total, cell_hits / total
 
+    # ----------------------------------------------------------------- #
+    # the sweep                                                          #
+    # ----------------------------------------------------------------- #
+
+    @staticmethod
+    def _axis_points(axes):
+        """A list of axes `{name: values}` expanded into parameter points.
+
+        A value that is not a list is a parameter held fixed, which is the same
+        as an axis of one. An empty mapping is one point with nothing in it, so
+        a sweep with no axes of some kind still runs once.
+        """
+        axes = {
+            k: (list(v) if isinstance(v, (list, tuple)) else [v])
+            for k, v in (axes or {}).items()
+        }
+        if not axes:
+            return [{}]
+        names = list(axes)
+        return [
+            dict(zip(names, values)) for values in itertools.product(*axes.values())
+        ]
+
+    @classmethod
+    def _scoring_points(cls, scoring):
+        """`_axis_points` for scoring, which may also be a list of axis sets.
+
+        A dict is crossed like any other axes. A list of dicts is the union of
+        each one's product: the way to sweep methods that take different
+        parameters, since crossing them in one dict would hand every method the
+        others' parameters too.
+        """
+        if isinstance(scoring, (list, tuple)):
+            return [point for axes in scoring for point in cls._axis_points(axes)]
+        return cls._axis_points(scoring)
+
+    @staticmethod
+    def method_takes(method, param):
+        """Whether the scoring method called `method` takes `param`."""
+        cls = SCORING_METHODS.get(
+            method or SoftAssigner.DEFAULT_SCORING_METHOD
+        )
+        if cls is None:
+            return False
+        sig = inspect.signature(cls.__init__).parameters
+        return param in sig or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.values()
+        )
+
+    def sweep(
+        self,
+        blur=None,
+        scoring=None,
+        evaluate=None,
+        gene_col_name="gene",
+        adata=None,
+        table_name=None,
+        rate=None,
+        after_blur=None,
+        save=True,
+        progress=True,
+    ):
+        """Cross any set of parameters, of any of the three kinds, in one run.
+
+        Each argument is `{parameter: [values]}` -- or a bare value for one held
+        fixed -- and the sweep is their product. Which parameters exist is not
+        this method's business: `scoring` takes whatever the named scoring
+        method takes, and `evaluate` whatever `RegionEvalParams` holds.
+
+        blur (dict): `blur_all_fovs` parameters, e.g.
+            `{"min_size": [25, 50], "max_dist": [3.5, 10]}`. Omit to sweep over
+            the blur already in the store.
+        scoring (dict, or list of dicts): the scoring method and its
+            parameters, e.g.
+            `{"method": ["additive matrix"], "normed": [False, True]}`. The
+            `"method"` key names the method; everything else is passed to it.
+            Methods that take the same parameters can be crossed in one dict;
+            for ones that do not, pass a list with one dict per parameter set,
+            and the sweep covers each one's product in turn::
+
+                scoring=[
+                    {"method": ["additive matrix", "mse difference"],
+                     "normed": [False, True]},
+                    {"method": "ml classifier", "epochs": [10, 30]},
+                ]
+
+            Omit to use the method already prepared.
+        evaluate (dict): any `RegionEvalParams` field, e.g.
+            `{"min_thresh": [0.7, 0.8], "default_thresh": [5, 10]}`.
+        rate (callable): `rate(sweeper, column, point, frames)` returning a dict
+            of metrics for that point, merged into its result row. None records
+            only which column was written.
+        after_blur (callable): `after_blur(sweeper, blur_point)`, run after each
+            re-blur and before scoring is prepared -- where a real sweep would
+            regenerate the cell-by-gene table the scoring reads, since blurring
+            changed what is in each cell.
+
+        The loops are ordered by what each parameter invalidates, so no point
+        pays for work an earlier one already did: blur is outermost (it rewrites
+        `cell_ids`, so everything downstream follows it), then scoring (its
+        reference has to be rebuilt), then the evaluation parameters a *scan*
+        depends on (`RegionEvalParams.SCAN_KEYS`), and innermost the ones that
+        only change how a scan is resolved. Sorting transcripts into confident
+        and ambiguous is the expensive half of an assignment, so the inner loop
+        reuses one scan across every value it does not depend on.
+
+        adata / table_name: the table scoring reads, for a method that reads
+            one. Handed to each point's method as its `table_name` parameter
+            (an `adata` that is not one of the sdata's tables is stored in
+            memory as `REFERENCE_TABLE` first), since scoring is chosen through
+            the evaluate methods' `scoring_method`/`scoring_params`.
+
+        returns: one dict per point -- its parameters, the `column` written, and
+            whatever `rate` returned.
+        """
+        reference = self._reference_table(adata, table_name)
+        eval_axes = dict(evaluate or {})
+        scan_axes = {
+            k: v for k, v in eval_axes.items() if k in RegionEvalParams.SCAN_KEYS
+        }
+        resolve_axes = {k: v for k, v in eval_axes.items() if k not in scan_axes}
+
+        blur_points = self._axis_points(blur)
+        score_points = self._scoring_points(scoring)
+        scan_points = self._axis_points(scan_axes)
+        resolve_points = self._axis_points(resolve_axes)
+
+        total = (
+            len(blur_points) * len(score_points)
+            * len(scan_points) * len(resolve_points)
+        )
+        pbar = tqdm(total=total) if progress else None
+        results = []
+
+        for blur_point in blur_points:
+            if blur_point:
+                self.blur_fovs(save=False, **blur_point)
+            if after_blur is not None:
+                after_blur(self, blur_point)
+
+            for score_point in score_points:
+                # the point's scoring, as the evaluate methods take it. Prepared
+                # here, through the same `use_scoring` they call, because the
+                # scan below already needs its cell types; the evaluate calls
+                # then ask for the same thing and find it ready
+                scoring = {}
+                if score_point:
+                    method, params = self.scoring_request(score_point, reference)
+                    self.asgn.use_scoring(method, params, save=False)
+                    scoring = {"scoring_method": method, "scoring_params": params}
+
+                for scan_point in scan_points:
+                    # gene_col_name is a scan parameter like any other, so a
+                    # sweep may vary it; the argument is the default it falls
+                    # back to rather than something that can be passed twice
+                    scan_args = {"gene_col_name": gene_col_name, **scan_point}
+                    scans = self.scan(**scan_args)
+                    frames = {fov: st["tr"] for fov, st in scans.items()}
+
+                    for resolve_point in resolve_points:
+                        point = {
+                            **blur_point, **score_point,
+                            **scan_point, **resolve_point,
+                        }
+                        column = self.assign(
+                            name=self.column_name(scoring.get("scoring_method")),
+                            scans=scans,
+                            save=False,
+                            **scoring,
+                            **scan_args,
+                            **resolve_point,
+                        )
+                        row = dict(point)
+                        row["column"] = column
+                        if rate is not None:
+                            row.update(rate(self, column, point, frames))
+                        results.append(row)
+                        if pbar is not None:
+                            pbar.update(1)
+
+        if pbar is not None:
+            pbar.close()
+        if save:
+            # every point's columns are in memory; write them out once
+            self.save_transcripts()
+        return results
+
+    def rate_unit_test_point(self, column, point=None, frames=None):
+        """`rate_unit_test` in the shape `sweep`'s `rate` hook wants."""
+        type_acc, cell_acc = self.rate_unit_test(
+            column, f"{column}_type", save=False, frames=frames
+        )
+        return {"type_acc": type_acc, "cell_acc": cell_acc}
+
     def run_unit_sweep(
         self,
         gene_col_name,
@@ -1612,66 +1940,61 @@ class ParamSweeper:
         max_dist=3.5,
         default_thresh=10,
         min_thresh=0.8,
+        scoring=None,
+        evaluate=None,
+        cats=None,
     ):
-        if isinstance(min_size, list):
-            sizes = min_size
-        else:
-            sizes = [min_size]
+        """The simulated-dataset sweep, as a `sweep` over the classic four.
 
-        if isinstance(max_dist, list):
-            dists = max_dist
-        else:
-            dists = [max_dist]
+        Kept as it was -- a list or a bare value for each of `min_size`,
+        `max_dist`, `default_thresh` and `min_thresh`, scored against the
+        simulation's ground truth -- but now a thin wrapper, so `scoring` and
+        `evaluate` can add any other axis on top of them.
 
-        if isinstance(default_thresh, list):
-            threshs = default_thresh
-        else:
-            threshs = [default_thresh]
+        `scoring` takes any scoring method, or several -- a dict, or a list of
+        dicts for methods with different parameters, as `sweep` describes:
 
-        if isinstance(min_thresh, list):
-            mins = min_thresh
-        else:
-            mins = [min_thresh]
-        results = []
+            scoring={"method": ["additive matrix", "mse difference",
+                                "ml classifier"]}
 
-        total_len = len(sizes) * len(dists) * len(threshs) * len(mins)
-        pbar = tqdm(total=total_len)
+        Its two defaults, `cats` (the simulation's cell types) and
+        `normed=False`, are only given to a method that takes them, so a
+        method with a parameter set of its own can be named alongside the
+        matrix methods without being handed theirs.
+        """
+        # fixes the simulation's table in place, in the sdata, so scoring can
+        # read it there by name
+        self.unit_test_table(unit_table_name)
+        defaults = {"cats": cats or {"celltype": ["ct_0", "ct_1"]},
+                    "normed": False}
+        score_axes = []
+        for axes in (scoring if isinstance(scoring, (list, tuple))
+                     else [scoring or {}]):
+            methods = axes.get("method", [None])
+            if not isinstance(methods, (list, tuple)):
+                methods = [methods]
+            # one axis set per method, so each gets only the defaults it takes
+            for method in methods:
+                per_method = {k: v for k, v in axes.items() if k != "method"}
+                if method is not None:
+                    per_method["method"] = method
+                for key, value in defaults.items():
+                    if key not in per_method and self.method_takes(method, key):
+                        per_method[key] = [value]
+                score_axes.append(per_method)
+        eval_axes = {"default_thresh": default_thresh, "min_thresh": min_thresh}
+        eval_axes.update(evaluate or {})
 
-        for size in sizes:
-            for dist in dists:
-                self.blur_fovs(size, dist, save=False)
-                self.process_unit_test(unit_table_name)
-
-                # min_thresh is the outer of the two: it decides which
-                # transcripts are ambiguous, so it is what a scan depends on.
-                # default_thresh only sets the margin a candidate assignment
-                # must clear, and every value of it reuses the same scan.
-                for min_t in mins:
-                    scans = self.scan(gene_col_name, min_t)
-                    frames = {fov: st["tr"] for fov, st in scans.items()}
-
-                    for thresh in threshs:
-                        pbar.update(1)
-                        entry = {
-                            "min_thresh": min_t,
-                            "default_thresh": thresh,
-                            "max_dist": dist,
-                            "min_size": size,
-                        }
-                        name = self.assign(
-                            gene_col_name, thresh, min_t, save=False, scans=scans
-                        )
-                        type_acc, cell_acc = self.rate_unit_test(
-                            name, f"{name}_type", save=False, frames=frames
-                        )
-                        entry["type_acc"] = type_acc
-                        entry["cell_acc"] = cell_acc
-                        results.append(entry)
-
-        pbar.close()
-        # every parameter point's columns are in memory; write them out once
-        self.save_transcripts()
-        return results
+        return self.sweep(
+            blur={"min_size": min_size, "max_dist": max_dist},
+            scoring=score_axes,
+            evaluate=eval_axes,
+            gene_col_name=gene_col_name,
+            table_name=unit_table_name,
+            rate=lambda sweeper, column, point, frames: (
+                sweeper.rate_unit_test_point(column, point, frames)
+            ),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -2247,7 +2570,6 @@ class DatasetFormatter:
         our_sd = SpatialData()
         if save_loc is not None:
             our_sd.write(Path(save_loc), overwrite=True)
-
 
         for fov in fovs:
             offset = DatasetFormatter._fov_offset(fov_locs, fov)
@@ -3143,7 +3465,9 @@ class LegacyRunLoader:
 
     CSV_GLOB = "fov_*_cellids.csv"
     CSV_RE = re.compile(r"fov_(?P<fov>\w+)_cellids\.csv$")
-    PYDICT_RE = re.compile(r"^(?P<kind>overlap_eval|delta_tallies)_(?P<col>.+)_fov_(?P<fov>\w+)\.pydict$")
+    PYDICT_RE = re.compile(
+        r"^(?P<kind>overlap_eval|delta_tallies)_(?P<col>.+)_fov_(?P<fov>\w+)\.pydict$"
+    )
 
     def __init__(self, complete_loc, gene_col_name="gene"):
         """complete_loc: the output directory of a pre-refactor run."""

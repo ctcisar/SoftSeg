@@ -9,7 +9,9 @@ from contextlib import closing
 from datetime import datetime
 from itertools import repeat
 from collections.abc import Mapping
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
+from typing import Optional
 
 import anndata as ad
 import cv2
@@ -19,11 +21,12 @@ import pandas as pd
 import shapely
 from matplotlib.patches import Circle
 #  from memory_profiler import profile
-from spatialdata import get_centroids, read_zarr
+from spatialdata import get_centroids
 from spatialdata.models import PointsModel
 from spatialdata.transformations import get_transformation
 from tqdm.auto import tqdm
 
+from .scoring import SCORING_METHODS, UNSET, CellTypeScoring, get_scoring_method
 from .SpatialDataHelpers import SpatialDataHelpers
 
 # The SoftAssigner instance the current worker process is bound to. Set once per
@@ -49,12 +52,80 @@ def _run_worker(args):
     return func(_WORKER_ASSIGNER, *rest)
 
 
+@dataclass(frozen=True)
+class RegionEvalParams:
+    """What to do when evaluating overlapping regions, as one object.
+
+    These thirteen knobs used to be spelled out three times over -- once in
+    `evaluate_all_overlapping_regions`, once in the positional `zip` it built
+    for the worker pool, and once in `evaluate_overlapping_regions_single_fov`
+    -- so adding one meant editing three lists and reordering one silently
+    mis-bound every argument after it. They travel together now.
+
+    What is deliberately *not* here is anything about *how* a candidate is
+    scored. `region_context` is a property of the scoring method -- a
+    declaration naming one of `SoftAssigner.REGION_CONTEXTS`, since it never
+    varies between runs of the same method -- and scoring by squared error is
+    a method of its own, "mse difference". Both live in `SoftSeg.scoring`.
+    Nor is the bookkeeping that says how a run is being driven: see the
+    `batch` argument on the evaluate methods.
+
+    Build one directly, or let either evaluate method build it from keywords --
+    `evaluate_all_overlapping_regions(min_thresh=0.8)` still reads the same way
+    it always has.
+    """
+
+    gene_col_name: str = "gene"
+    min_thresh: float = 0.7
+    default_thresh: float = 5
+    only_tagged_cells: Optional[list] = None
+    use_other_cells: bool = False
+    assigned_col: str = "assignment"
+    omit_blanks: bool = True
+    auto_assign_single_target: bool = False
+    save_delta_tallies: bool = False
+    overwrite: bool = False
+    recompute_og: bool = False
+
+    @classmethod
+    def build(cls, params=None, **overrides):
+        """One of these from whatever a caller passed.
+
+        `params` already being one is the pooled case -- it arrives built, and
+        any overrides are applied on top.
+        """
+        unknown = set(overrides) - {f.name for f in fields(cls)}
+        if unknown:
+            raise TypeError(
+                f"Unknown evaluation parameter(s) {sorted(unknown)}. "
+                f"Expected any of {[f.name for f in fields(cls)]}."
+            )
+        base = params if params is not None else cls()
+        return replace(base, **overrides) if overrides else base
+
+    def _subset(self, names):
+        return {name: getattr(self, name) for name in names}
+
+    SCAN_KEYS = (
+        "gene_col_name", "min_thresh", "only_tagged_cells", "use_other_cells",
+        "omit_blanks", "auto_assign_single_target",
+    )
+    RESOLVE_KEYS = ("default_thresh", "use_other_cells")
+
+    def scan_kwargs(self):
+        """The subset `scan_overlapping_regions` takes."""
+        return self._subset(self.SCAN_KEYS)
+
+    def resolve_kwargs(self):
+        """The subset `resolve_overlapping_regions` takes."""
+        return self._subset(self.RESOLVE_KEYS)
+
+
 # The scoring matrix's QC bounds have no default: what counts as too few
 # transcripts depends on the panel, so a number that suits one dataset throws
 # away most of another. They belong to the dataset, and are carried in its
 # attrs -- see `SoftAssigner.qc_bounds`. This marks an argument nobody passed,
 # which is not the same as one passed as None (that turns the filter off).
-UNSET = object()
 
 
 # How every per-transcript assignment column says "no cell here" -- see
@@ -220,7 +291,22 @@ class SoftAssigner:
         the only way their results get back to the parent.
         """
         self._set_sdata(sdata)
-        self._cell_to_type = None  # filled by get_scoring_matrix, or read back
+        # whatever last gave this assigner cell types -- a scoring method, a
+        # column of the cell-by-gene table, or an outright assignment -- else
+        # read back from the store on first access
+        self._cell_to_type = None
+        # cells the scoring table's QC filter dropped. Untyped like any cell
+        # missing from cell_to_type, but unlike one that merely has no label they
+        # are not compared even under use_other_cells -- see scoring_table
+        self.qc_excluded_cells = frozenset()
+        # the scoring method in force, and the transcript->gene lookup every one
+        # of them scores through. The lookup is filled by scan_overlapping_regions
+        # as it reads a FOV, so it is per-FOV rather than part of the reference.
+        self.scorer = None
+        # (method, params) the scorer was built from by `use_scoring`, so a
+        # later evaluate call asking for the same one reuses it
+        self._scoring_request = None
+        self.tr_to_gene = {}
         self.save_to_disk = save_to_disk
         self.pool_size = pool_size
         self.logger = logging.getLogger()
@@ -267,8 +353,10 @@ class SoftAssigner:
                     "This SoftAssigner has no SpatialData attached; pass one to "
                     "__init__ or call _set_sdata()."
                 )
-            SpatialDataHelpers.quiet_ome_zarr()
-            self._sdata = read_zarr(Path(self._sdata_path))
+            # shapes and tables are read an element at a time as they are asked
+            # for: read whole, a full store's run to tens of GB before a FOV
+            # has been touched
+            self._sdata = SpatialDataHelpers.open_store(self._sdata_path)
         return self._sdata
 
     def _reload_sdata(self):
@@ -447,16 +535,21 @@ class SoftAssigner:
         they came from. Kept separate from writing them so that a pooled run can
         hand these back from the worker and merge them in the parent, rather than
         having every worker rewrite the same shared element.
+
+        `transcript_id` is an integer, which is what a transcript id is: as a
+        float it read back as "997019.0", and a float64 cannot even hold an id
+        past 2**53 exactly -- it rounds it to a neighbour silently, which for an
+        identifier means pointing at the wrong transcript.
         """
         cells, ids = [], []
         for cell, transcripts in assigned_trs.items():
             cells.extend([str(cell)] * len(transcripts))
-            ids.extend(float(t) for t in transcripts)
+            ids.extend(int(t) for t in transcripts)
         trs = pd.DataFrame(
             {
                 "fov": pd.Series([str(fov)] * len(cells), dtype=object),
                 "cell_id": pd.Series(cells, dtype=object),
-                "transcript_id": pd.Series(ids, dtype=float),
+                "transcript_id": pd.Series(ids, dtype="int64"),
             }
         )
 
@@ -473,6 +566,21 @@ class SoftAssigner:
             }
         )
         return trs, seg
+
+    @staticmethod
+    def _integral_transcript_ids(frame):
+        """One rows frame with `transcript_id` as an integer, if it has one.
+
+        Rows written before the column was an integer read back as floats. Every
+        row is a real (cell, transcript) pair, so there is nothing absent to make
+        room for and the cast is strict on purpose: a NaN here would mean the
+        rows are not what this table is supposed to hold, and quietly turning it
+        into some integer would be worse than saying so.
+        """
+        column = "transcript_id"
+        if column not in frame.columns or pd.api.types.is_integer_dtype(frame[column]):
+            return frame
+        return frame.assign(**{column: frame[column].astype("int64")})
 
     def _merge_region_rows(self, name, frames, overwrite):
         """A table's existing rows with these FOVs' rows merged in.
@@ -510,6 +618,11 @@ class SoftAssigner:
 
         parts = [old] if old is not None and len(old) else []
         parts.extend(keep.values())
+        # each part before the concat, not the result after it: a table written
+        # before transcript_id was an integer holds floats, and one float part
+        # would pull the integer rows being merged in up to float and put the
+        # decimal point back on all of them
+        parts = [self._integral_transcript_ids(p) for p in parts]
         obs = pd.concat(parts, ignore_index=True)
         obs.index = [str(i) for i in range(len(obs))]
         return ad.AnnData(np.zeros((len(obs), 0)), obs=obs)
@@ -607,19 +720,41 @@ class SoftAssigner:
 
     CELL_TYPE_TABLE = "cell_to_type"
 
+    #: Spellings of "no cell type here" that a source column may use, which are
+    #: dropped rather than becoming a type named "None". "Unassigned" is one:
+    #: an annotation's word for a cell it could not type, which the region scan
+    #: has always treated as untyped.
+    MISSING_TYPES = frozenset(
+        {"None", "nan", "NaN", "NA", "<NA>", "", "Unassigned"}
+    )
+
     @property
     def cell_to_type(self):
-        """Which cell type each cell was given -- `{cell id: cell type}`.
+        """Which cell type each cell has -- `{cell id: cell type}`.
 
-        `get_scoring_matrix` builds this off the cell-by-gene table's cell type
-        column, and stores it in the sdata as the `CELL_TYPE_TABLE` table. An
-        assigner that has not run that method reads it back from there, so a
-        store that has been scored once can be picked up again -- to evaluate
-        more FOVs, say -- without rebuilding the scoring matrix first.
+        The mapping the evaluation steps read, and the thing a run needs before
+        `evaluate_overlapping_regions` can tell two cells apart. It is stored in
+        the sdata as the `CELL_TYPE_TABLE` table, and read back from there on
+        first access, so a store that has been given cell types once can be
+        picked up again -- to evaluate more FOVs, say -- without redoing it.
 
-        Note that only this mapping is stored, not `score_mat`: resolving an
-        overlapping region needs both, so reading this back lets you see and use
-        the cell types, but scoring still wants `get_scoring_matrix`.
+        Three ways in, none of them privileged:
+
+        * `set_cell_types_from_table`, reading a column of the cell-by-gene
+          table. This is the plain one: `CellTypeAssigner` leaves its
+          annotation in such a column, and so does anything else that typed the
+          cells elsewhere.
+        * a scoring method, as a side effect of building its reference --
+          `AdditiveMatrixScoring` does, since it has the types in hand anyway.
+        * assignment, for a mapping built some other way entirely:
+          `assigner.cell_to_type = {...}`, then `save_cell_to_type()` to keep
+          it. The setter normalises what it is given, so a dict keyed by ints
+          or carrying nulls is stored the same way as any other.
+
+        Note that this mapping is all that is stored, not a scoring method's
+        reference: resolving an overlapping region needs both, so having the
+        cell types back lets you see and use them, but scoring still wants its
+        method prepared.
         """
         if self._cell_to_type is None:
             self._cell_to_type = self.load_cell_to_type()
@@ -627,19 +762,98 @@ class SoftAssigner:
 
     @cell_to_type.setter
     def cell_to_type(self, mapping):
-        self._cell_to_type = mapping
+        self._cell_to_type = (
+            None if mapping is None else self.as_cell_to_type(mapping)
+        )
+
+    @classmethod
+    def as_cell_to_type(cls, mapping):
+        """One `{cell id: cell type}` dict, however it was spelled.
+
+        Ids and types both as strings, and cells with no type at all left out
+        rather than typed "None" -- an untyped cell is one an overlapping region
+        skips over, which is not the same as a cell whose type is the word.
+        Every way of setting the mapping goes through this, so what a scoring
+        method builds and what `set_cell_types_from_table` reads are the same
+        shape, and `save_cell_to_type` can rely on it.
+        """
+        out = {}
+        for cell, cell_type in dict(mapping).items():
+            if cell_type is None or (
+                isinstance(cell_type, float) and np.isnan(cell_type)
+            ):
+                continue
+            try:
+                if pd.isna(cell_type):
+                    continue
+            except (TypeError, ValueError):
+                pass
+            text = str(cell_type)
+            if text in cls.MISSING_TYPES:
+                continue
+            out[str(cell)] = text
+        return out
+
+    def set_cell_types_from_table(self, column=None, table_name=None,
+                                  adata=None, save=True):
+        """Take the cell types from a column of the cell-by-gene table.
+
+        The route for cells typed somewhere other than a scoring method --
+        `CellTypeAssigner`'s annotation, a label transferred from a reference,
+        a column written by hand. The cell ids are the table's `obs_names`,
+        which is what `generate_cxg_table` indexes it by.
+
+        column (string): the obs column holding the types. None finds it, the
+            same way `get_scoring_matrix` does when it is not told either
+            (`infer_cats`), and raises naming the candidates if the table has
+            more than one it could be.
+        table_name (string): which table to read, for a store holding several.
+            Defaults to the one `generate_cxg_table` left (`default_cxg_table`).
+        adata: a table to read instead of one from the sdata.
+        save (bool): write the mapping back as the `CELL_TYPE_TABLE` table.
+
+        Cells with no type in that column are left out of the mapping, so they
+        are untyped as far as an overlapping region is concerned. Note that this
+        types every cell the column names: a scoring method may type fewer, since
+        it only knows the cells that survived its own filtering.
+
+        returns: the mapping, which is also now `self.cell_to_type`.
+        """
+        if adata is None:
+            # only the obs is needed, and a table not yet read is read for that
+            # alone -- a cell-by-gene table's matrix is most of its size
+            obs = SpatialDataHelpers.table_obs(
+                self.sdata, self.default_cxg_table_name(table_name)
+            )
+        else:
+            obs = adata.obs
+        if column is None:
+            column = next(iter(self.infer_cats(obs, column=None)))
+        elif column not in obs.columns:
+            raise KeyError(
+                f"No obs column {column!r} on this table; have "
+                f"{list(obs.columns)}."
+            )
+
+        self.cell_to_type = dict(zip(obs.index, obs[column]))
+        self.logger.info(
+            f"[{datetime.now()}] cell types from obs column {column!r}: "
+            f"{len(self._cell_to_type)} of {len(obs)} cells typed."
+        )
+        self.save_cell_to_type(save=save)
+        return self._cell_to_type
 
     def save_cell_to_type(self, save=True):
         """Store the cell-to-type mapping in the sdata as a table."""
-        cells = list(self._cell_to_type)
+        mapping = self.as_cell_to_type(self._cell_to_type or {})
+        cells = list(mapping)
         table = ad.AnnData(np.zeros((len(cells), 0)))
         table.obs_names = [str(c) for c in cells]
         table.obs["cell_id"] = pd.Series(
-            [str(c) for c in cells], index=table.obs_names, dtype=object
+            cells, index=table.obs_names, dtype=object
         )
         table.obs["cell_type"] = pd.Series(
-            [str(self._cell_to_type[c]) for c in cells],
-            index=table.obs_names, dtype=object,
+            [mapping[c] for c in cells], index=table.obs_names, dtype=object,
         )
         return self.save_table(self.CELL_TYPE_TABLE, table, save=save)
 
@@ -647,13 +861,15 @@ class SoftAssigner:
         """Read the cell-to-type mapping back out of the sdata."""
         if self.CELL_TYPE_TABLE not in self.sdata.tables:
             raise KeyError(
-                f"No cell types available: this assigner has not run "
-                "`get_scoring_matrix`, and the sdata has no "
-                f"{self.CELL_TYPE_TABLE!r} table left by one that did. Run "
-                "`get_scoring_matrix()` first."
+                f"No cell types available: nothing has given this assigner any, "
+                f"and the sdata has no {self.CELL_TYPE_TABLE!r} table left by "
+                "anything that did. Either read them off the cell-by-gene table "
+                "(`set_cell_types_from_table()`), prepare a scoring method that "
+                "builds them (`get_scoring_matrix()`), or set `cell_to_type` "
+                "directly."
             )
         obs = self.sdata.tables[self.CELL_TYPE_TABLE].obs
-        return dict(zip(obs["cell_id"], obs["cell_type"]))
+        return self.as_cell_to_type(dict(zip(obs["cell_id"], obs["cell_type"])))
 
     def has_column(self, fov, column):
         """True if the FOV's transcript table already carries `column`.
@@ -732,6 +948,405 @@ class SoftAssigner:
         if save and self.save_to_disk and self.sdata.is_backed():
             self.sdata.write_attrs()
         return attrs.get(self.BLUR_ATTRS)
+
+    SCORING_ATTRS = "scoring"
+
+    def scoring_params(self, assigned_col=None):
+        """How a column was produced, as recorded in the sdata.
+
+        The evaluate methods write one entry per assignment column, in three
+        parts, so a store says how each of its columns came about rather than
+        leaving it to be remembered (see `record_scoring`):
+
+        * `"evaluate"` -- the `RegionEvalParams` the evaluation ran with, plus
+          `"fovs"`, every FOV evaluated into this column so far;
+        * `"scoring"` -- the scoring method's `"method"` name and parameters,
+          the `"region_context"` it was scored under and, for a method that
+          QC-filters its table, the `"qc_cells"` bounds applied;
+        * `"blur"` -- the blur the `cell_ids` it read came from, as recorded in
+          `attrs["blur"]` at the time (None when nothing vouched for them).
+
+        assigned_col: which column to look up. None returns the whole record,
+            `{column: entry}`.
+        """
+        recorded = (getattr(self.sdata, "attrs", None) or {}).get(self.SCORING_ATTRS)
+        recorded = dict(recorded) if isinstance(recorded, Mapping) else {}
+        if assigned_col is None:
+            return recorded
+        entry = recorded.get(str(assigned_col))
+        return dict(entry) if isinstance(entry, Mapping) else None
+
+    def set_scoring_params(self, assigned_col, params, save=True):
+        """Store `assigned_col`'s record as given, or clear it with None.
+
+        params (dict): the whole entry, as `record_scoring` builds it. Values
+            have to survive a round-trip through zarr's JSON.
+        """
+        attrs = dict(getattr(self.sdata, "attrs", None) or {})
+        recorded = dict(attrs.get(self.SCORING_ATTRS) or {})
+        if params is None:
+            recorded.pop(str(assigned_col), None)
+        else:
+            recorded[str(assigned_col)] = dict(params)
+        if recorded:
+            attrs[self.SCORING_ATTRS] = recorded
+        else:
+            attrs.pop(self.SCORING_ATTRS, None)
+        self.sdata.attrs = attrs
+        if save and self.save_to_disk and self.sdata.is_backed():
+            self.sdata.write_attrs()
+        return recorded.get(str(assigned_col))
+
+    #: Method parameters left out of the record: which table the reference was
+    #: read from says where it came from, not how the column was scored, and a
+    #: store's tables can be renamed or replaced under it.
+    UNRECORDED_SCORING_PARAMS = ("table_name", "source")
+
+    def record_scoring(self, assigned_col, params=None, fovs=(), save=True):
+        """Record how `assigned_col` was produced, as `scoring_params` reads it.
+
+        params (RegionEvalParams): what the evaluation ran with.
+        fovs: the FOVs this call evaluated. They are added to those already
+            recorded for the column, since a column is often built up over
+            several calls.
+        """
+        if self.scorer is None:
+            return None
+        scoring = {"method": self.scorer.name}
+        scoring.update(
+            (k, v) for k, v in self.scorer.params.items()
+            if k not in self.UNRECORDED_SCORING_PARAMS
+        )
+        # declared by the method class rather than passed, so recorded
+        # explicitly: the record should say what the column was scored against
+        scoring["region_context"] = self.scorer.region_context
+        # the QC is the assigner's, not the method's, but it shaped the
+        # reference, so it belongs in the record of how the column was produced
+        if self.scorer.use_qc_filter:
+            scoring["qc_cells"] = {
+                k: v for k, v in (self.qc_bounds() or {}).items() if v is not None
+            }
+
+        previous = self.scoring_params(assigned_col) or {}
+        known = (previous.get("evaluate") or {}).get("fovs") or []
+        evaluate = asdict(params) if params is not None else {}
+        evaluate["fovs"] = sorted({str(f) for f in known} | {str(f) for f in fovs})
+
+        entry = {
+            "evaluate": evaluate,
+            "scoring": scoring,
+            "blur": self.blur_params(),
+        }
+        return self.set_scoring_params(
+            assigned_col, self._json_safe(entry), save=save
+        )
+
+    #: Transcript columns that are not any one run's to remove: the transcripts
+    #: themselves, the soft assignment every run reads, and the original
+    #: segmentation every run is compared against.
+    SHARED_COLUMNS = frozenset({
+        "index", "x", "y", "z", "global_x", "global_y", "global_z", "gene",
+        "cell_ids", "og_cell", "og_type",
+    })
+
+    def run_elements(self, assigned_col):
+        """What the evaluation that wrote `assigned_col` left in the sdata.
+
+        returns: `{"columns": {fov: [column, ...]}, "tables": [name, ...],
+            "attrs": bool}` -- the transcript columns per FOV (`assigned_col`
+            and `f"{assigned_col}_type"`), the tables (the region tables, each
+            FOV's delta tallies, and the `cxg_resegmented_{assigned_col}` table
+            `generate_cxg_table` writes from it by default), and whether
+            `attrs["scoring"]` has an entry for it. Only what is actually
+            present is listed; reading it touches schemas and names, no data.
+        """
+        assigned_col = str(assigned_col)
+        columns = (assigned_col, f"{assigned_col}_type")
+        fovs = self.get_all_fovs()
+        found_columns = {}
+        for f in fovs:
+            present = [c for c in columns if self.has_column(f, c)]
+            if present:
+                found_columns[f] = present
+        candidates = [
+            *self.region_table_names(assigned_col),
+            f"cxg_resegmented_{assigned_col}",
+            *(f"{f}_deltas_{assigned_col}" for f in fovs),
+        ]
+        return {
+            "columns": found_columns,
+            "tables": [t for t in candidates if t in self.sdata.tables],
+            "attrs": self.scoring_params(assigned_col) is not None,
+        }
+
+    def remove_results(self, assigned_col, save=True):
+        """Remove everything one evaluation run wrote, by its column name.
+
+        Takes out `assigned_col` and `f"{assigned_col}_type"` from every FOV's
+        transcript table, the run's tables -- `assigned_trs_{col}`,
+        `seg_is_default_{col}`, each FOV's `{fov}_deltas_{col}` and
+        `cxg_resegmented_{col}` -- and its entry in `attrs["scoring"]`; see
+        `run_elements`, which this removes and returns.
+
+        `og_cell` and `og_type` stay: they are the original segmentation every
+        run is compared against, not this run's result. A `generate_cxg_table`
+        output stored under a name of its own choosing is not found, since
+        nothing records which column it came from.
+
+        save (bool): also remove them from the store, which cannot be undone.
+            False, or an assigner built with `save_to_disk=False`, removes them
+            from the sdata in memory only.
+
+        returns: what was removed, as `run_elements` describes it.
+        """
+        assigned_col = str(assigned_col)
+        if assigned_col in self.SHARED_COLUMNS:
+            raise ValueError(
+                f"{assigned_col!r} is not one run's result: every run reads or "
+                "compares against it, so it cannot be removed this way."
+            )
+        found = self.run_elements(assigned_col)
+        persist = save and self.save_to_disk and self.sdata.is_backed()
+
+        # a FOV at a time, so what this holds follows the largest FOV
+        for f, columns in found["columns"].items():
+            tr = self.get_transcripts(f).drop(columns=columns)
+            self.set_transcripts(f, tr, save=persist)
+
+        for name in found["tables"]:
+            if persist:
+                SpatialDataHelpers.remove_element(self.sdata, name)
+            else:
+                del self.sdata.tables[name]
+
+        if found["attrs"]:
+            self.set_scoring_params(assigned_col, None, save=persist)
+
+        self.logger.info(
+            f"[{datetime.now()}] removed run {assigned_col!r}: columns in "
+            f"{len(found['columns'])} FOVs, tables {found['tables']}, "
+            f"attrs entry: {found['attrs']}"
+            + ("" if persist else " (in memory only)")
+        )
+        return found
+
+    @classmethod
+    def _json_safe(cls, value):
+        """`value` in the types zarr's JSON attrs hold: numpy scalars become
+        python ones, tuples and sets lists, and mapping keys strings."""
+        if isinstance(value, Mapping):
+            return {str(k): cls._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (set, frozenset)):
+            return [cls._json_safe(v) for v in sorted(value, key=str)]
+        if isinstance(value, (list, tuple)):
+            return [cls._json_safe(v) for v in value]
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+
+    # ----------------------------------------------------------------- #
+    # choosing and preparing a scoring method                            #
+    # ----------------------------------------------------------------- #
+
+    # ----------------------------------------------------------------- #
+    # region contexts: what a candidate is scored alongside               #
+    # ----------------------------------------------------------------- #
+
+    def _context_new_trs(self, cells, conf_trs, assigned_trs):
+        """Only the new transcripts: a candidate is scored on what it places."""
+        return {}
+
+    def _context_conf_trs(self, cells, conf_trs, assigned_trs):
+        """Everything already in each cell: its confident transcripts, plus
+        whatever earlier regions of this FOV have already given it."""
+        return self.dict_merge(conf_trs, assigned_trs, cells)
+
+    #: The region contexts a scoring method can be scored against, by name. A
+    #: method names one in its `region_context`; `build_region_context` builds it
+    #: once per ambiguous region and the result is handed to every `score` of
+    #: that region, since a region's candidates differ only in where its
+    #: *ambiguous* transcripts go and what is already settled is the same for
+    #: all of them. "new_trs" is the default a method gets without saying so.
+    #:
+    #: Each builder takes `(cells, conf_trs, assigned_trs)` and returns
+    #: `{cell: [transcript id, ...]}`. Add one here and any scoring method can
+    #: name it; the methods themselves do not define contexts.
+    REGION_CONTEXTS = {
+        "new_trs": _context_new_trs,
+        "conf_trs": _context_conf_trs,
+    }
+
+    def build_region_context(self, cells, conf_trs, assigned_trs):
+        """Build the region context the current scoring method asked for."""
+        scorer = self.require_scorer()
+        name = scorer.region_context
+        builder = self.REGION_CONTEXTS.get(name)
+        if builder is None:
+            raise KeyError(
+                f"{type(scorer).__name__}.region_context is {name!r}, which is "
+                f"not a region context. "
+                f"Available: {sorted(self.REGION_CONTEXTS)}."
+            )
+        return builder(self, cells, conf_trs, assigned_trs)
+
+    #: What `set_scoring_method` uses when it is not told otherwise.
+    DEFAULT_SCORING_METHOD = "additive matrix"
+
+    @staticmethod
+    def scoring_methods():
+        """The scoring methods that can be named, as `{name: class}`."""
+        return dict(SCORING_METHODS)
+
+    def set_scoring_method(self, name=None, **params):
+        """Choose how candidate assignments are scored, without preparing yet.
+
+        name: a key of `scoring_methods()`. Defaults to "additive matrix", the
+            per-cell-type average expression matrix this package started with.
+        params: whatever that method takes -- they differ by method, which is
+            the point of naming one rather than passing flags.
+
+        returns: the method, unprepared. `prepare_scoring` builds its reference;
+            `get_scoring_matrix` does both in one call for the default method.
+        """
+        self.scorer = get_scoring_method(
+            self.DEFAULT_SCORING_METHOD if name is None else name, self, **params
+        )
+        self._scoring_request = None
+        return self.scorer
+
+    @staticmethod
+    def _check_scoring_args(scoring_params):
+        """Refuse `scoring_params` that are not a mapping of parameters."""
+        if scoring_params is not None and not isinstance(scoring_params, Mapping):
+            raise TypeError(
+                f"scoring_params must be a dict of the method's parameters, "
+                f"not {type(scoring_params).__name__}."
+            )
+
+    def use_scoring(self, method=None, params=None, save=True):
+        """Make `method`, with `params`, the prepared scoring method in force.
+
+        What the evaluate methods' `scoring_method`/`scoring_params` arguments
+        do. If the method in force was built by an earlier call asking for
+        exactly this, it is reused -- preparing can mean building a reference or
+        training a model, which a run over many FOVs, or a sweep calling once
+        per FOV, should pay for once. Otherwise it is built and prepared, and
+        stays in force afterwards like one chosen with `set_scoring_method`.
+
+        method (string): a key of `scoring_methods()`. None with `params` given
+            keeps the current method's name (or the default) and rebuilds it
+            with these parameters. None with no `params` keeps whatever is in
+            force, preparing it if it is not yet -- and if nothing is, the
+            default, "additive matrix", with its default parameters.
+        params (dict): the method's parameters, in full -- the method is built
+            from these alone, not from these on top of whatever it had before.
+        save: whether preparing may write what it builds (`cell_to_type`) to
+            the store.
+
+        returns: the prepared scoring method.
+        """
+        if method is None and not params:
+            # nothing asked for: whatever is in force, else the default
+            if self.scorer is None:
+                self.set_scoring_method()
+            if not self.scorer.prepared:
+                self.prepare_scoring(save=save)
+            return self.scorer
+        if method is None:
+            method = (self.scorer.name if self.scorer is not None
+                      else self.DEFAULT_SCORING_METHOD)
+        params = dict(params or {})
+        request = (method, repr(self._json_safe(params)))
+        if (self.scorer is not None and self.scorer.prepared
+                and self._scoring_request == request):
+            return self.scorer
+        self.set_scoring_method(method, **params)
+        self.prepare_scoring(save=save)
+        self._scoring_request = request
+        return self.scorer
+
+    def scoring_table(self, adata=None, table_name=None, min_counts=UNSET,
+                      max_counts=UNSET, min_genes=UNSET, min_cells=UNSET):
+        """The cell-by-gene table a scoring method should be prepared from.
+
+        Resolves which table (the one `generate_cxg_table` left in the sdata,
+        unless one is handed in or named) and applies the QC bounds to a copy of
+        it. The stored table is not touched.
+
+        The bounds belong to the dataset rather than to any scoring method --
+        what counts as too few transcripts for a cell depends on the panel -- so
+        they live here and in `attrs["qc_cells"]`. *Whether* to apply them is the
+        method's business: a method declares `use_qc_filter`, and one that says
+        False gets the table unfiltered however the bounds are set. See
+        `filter_for_scoring` for what the filtering does.
+
+        min_counts / max_counts / min_genes / min_cells: override the recorded
+            bounds for this call. Left unpassed each defers to the sdata; passed
+            as None each turns that filter off.
+
+        Which cells the filter dropped is kept as `qc_excluded_cells`. They are
+        untyped, but not in the way a cell with no label is: under
+        `use_other_cells` an unlabelled cell is still compared, scored against
+        the "other" row, while a region holding a cell that failed QC is skipped
+        as it would be without `use_other_cells` -- what is in that cell is not
+        trusted enough to compare.
+        """
+        if adata is None:
+            adata = self.default_cxg_table(table_name)
+        if self.scorer is not None and not self.scorer.use_qc_filter:
+            self.qc_excluded_cells = frozenset()
+            return adata
+        out = self.filter_for_scoring(
+            adata,
+            **self.resolve_qc_bounds(
+                min_counts=min_counts, max_counts=max_counts,
+                min_genes=min_genes, min_cells=min_cells,
+            ),
+        )
+        self.qc_excluded_cells = frozenset(
+            adata.obs_names.difference(out.obs_names).astype(str)
+        )
+        return out
+
+    def prepare_scoring(self, adata=None, save=True, table_name=None, **qc):
+        """Build the current scoring method's reference.
+
+        The second half of choosing a method, kept separate so the choice can be
+        made without paying for the preparation -- and so a method's reference
+        can be rebuilt against a different table without re-stating its
+        parameters.
+
+        The table is resolved and QC-filtered here, by `scoring_table`, and the
+        method is handed the result: what to score is the assigner's business,
+        how to score it is the method's.
+
+        qc: any of `QC_KEYS`, passed through to `scoring_table`.
+        """
+        if self.scorer is None:
+            self.set_scoring_method()
+        if table_name is None:
+            table_name = getattr(self.scorer, "table_name", None)
+        # A table is resolved here when one was handed in, or when the method
+        # declares it wants the QC applied -- which only a method reading
+        # per-cell profiles does. A method that needs no cell-by-gene table at
+        # all gets None and is not made to find one: resolving the default would
+        # fail on a store that has none, for a method that never wanted it.
+        if adata is not None or self.scorer.use_qc_filter:
+            adata = self.scoring_table(adata, table_name=table_name, **qc)
+        self.scorer.prepare(adata=adata, save=save)
+        return self.scorer
+
+    def require_scorer(self):
+        """The prepared scoring method, preparing the default if there is none.
+
+        Nothing chosen means "additive matrix" with its default parameters,
+        built and prepared here (see `use_scoring`).
+        """
+        return self.use_scoring()
+
+    def score_mat(self):
+        """The current method's `{gene: {cell type: value}}` matrix, if it has one."""
+        return getattr(self.scorer, "score_mat", None)
 
     QC_ATTRS = "qc_cells"
     QC_KEYS = ("min_counts", "max_counts", "min_genes", "min_cells")
@@ -960,6 +1575,10 @@ class SoftAssigner:
                 if cell_id in excluded or geom is None or geom.is_empty:
                     continue
                 by_cell.setdefault(cell_id, {})[int(z)] = geom
+            # read straight off the store and unchanged, so it can be read again
+            # if wanted; held, a run over every FOV would end up holding them all
+            del gdf
+            SpatialDataHelpers.release_element(source, name)
         return by_cell
 
     def get_all_fovs(self):
@@ -2012,18 +2631,22 @@ class SoftAssigner:
         default -- then a single "cxg*" table if that is the only candidate. A
         store holding several is ambiguous and says so rather than guessing.
         """
+        return self.sdata.tables[self.default_cxg_table_name(table_name)]
+
+    def default_cxg_table_name(self, table_name=None):
+        """The name `default_cxg_table` resolves to, without reading the table."""
         tables = list(self.sdata.tables)
         if table_name is not None:
             if table_name not in tables:
                 raise KeyError(f"No table {table_name!r} in this sdata; have {tables}")
-            return self.sdata.tables[table_name]
+            return table_name
 
         if "cxg" in tables:
-            return self.sdata.tables["cxg"]
+            return "cxg"
 
         candidates = [t for t in tables if t.startswith("cxg")]
         if len(candidates) == 1:
-            return self.sdata.tables[candidates[0]]
+            return candidates[0]
         raise KeyError(
             "Could not tell which table to score against. Run "
             "`generate_cxg_table()` first, or name one with `table_name=`; "
@@ -2043,18 +2666,25 @@ class SoftAssigner:
         `generate_cxg_table` writes itself, and is not unique per cell. Exactly
         one such column is needed to be unambiguous; otherwise the caller is
         asked which to use.
+
+        `adata` may also be just a table's obs frame, which is all this reads.
         """
+        obs = adata.obs if hasattr(adata, "obs") else adata
+
         def labels_of(col):
-            values = adata.obs[col]
+            # a spelling of "no type" is not one of the types: those cells are
+            # untyped, and scored against the reference's "other" row
+            values = obs[col]
             return sorted(
-                str(v) for v in pd.unique(values.dropna()) if str(v) != "nan"
+                str(v) for v in pd.unique(values.dropna())
+                if str(v) not in self.MISSING_TYPES
             )
 
         if column is not None:
-            if column not in adata.obs.columns:
+            if column not in obs.columns:
                 raise KeyError(
                     f"No obs column {column!r} on this table; have "
-                    f"{list(adata.obs.columns)}."
+                    f"{list(obs.columns)}."
                 )
             labels = labels_of(column)
             if not labels:
@@ -2065,15 +2695,15 @@ class SoftAssigner:
             return {column: labels}
 
         candidates = {}
-        for col in adata.obs.columns:
+        for col in obs.columns:
             if col in self.CXG_OBS_COLUMNS:
                 continue
-            values = adata.obs[col]
+            values = obs[col]
             if not (isinstance(values.dtype, pd.CategoricalDtype)
                     or values.dtype == object):
                 continue
             labels = labels_of(col)
-            if not labels or len(labels) >= len(adata):
+            if not labels or len(labels) >= len(obs):
                 continue  # empty, or an identifier rather than a type
             candidates[col] = labels
 
@@ -2120,10 +2750,13 @@ class SoftAssigner:
         min_cells (int): keep genes expressed in at least this many cells, after
             the cell filters have been applied.
 
-        Note what a dropped cell means downstream: it is absent from
-        `cell_to_type`, so it is untyped, and an overlapping region containing it
-        is skipped unless `use_other_cells=True`. A dropped gene simply stops
-        contributing to any score, as a blank does.
+        Note what a dropped cell means downstream when a scoring method is what
+        built the cell types: it is absent from `cell_to_type`, so it is
+        untyped, and an overlapping region containing it is skipped unless
+        `use_other_cells=True`. Types read straight off the table
+        (`set_cell_types_from_table`) are not filtered this way, so the same
+        cell would be typed there. A dropped gene simply stops contributing to
+        any score, as a blank does.
 
         returns: the filtered AnnData, or the original when nothing was asked
             for. Never modifies the table it was given.
@@ -2175,9 +2808,16 @@ class SoftAssigner:
     def get_scoring_matrix(
         self, adata=None, cats=None, normed=False, table_name=None, save=True,
         min_counts=UNSET, max_counts=UNSET, min_genes=UNSET, min_cells=UNSET,
+        method="additive matrix",
     ):
-        """
-        Need to run this before evaluate_overlapping_regions
+        """Build a cell-type scoring reference. Run before evaluating.
+
+        A convenience over `set_scoring_method(method, ...)` plus
+        `prepare_scoring()`, kept because it is what every existing script calls.
+        `method` is any of the cell-type scoring methods (`CellTypeScoring`) --
+        "additive matrix", the default, or "mse difference" -- since they share
+        this reference and these parameters. See `SoftSeg.scoring` for what a
+        scoring method is and how to add another.
 
         cats is the possible cell types as they are described in adata. Give it
         either way round:
@@ -2204,112 +2844,41 @@ class SoftAssigner:
         overlapping region containing it is skipped unless `use_other_cells`.
         Left unpassed, each defers to what the sdata records (`qc_bounds`, set at
         init or with `set_qc_bounds`); passing None turns that filter off for
-        this call. A store with no recorded bounds filters nothing.
+        this call. A store with no recorded bounds filters nothing. These are the
+        assigner's, applied by `scoring_table`; the method only declares that it
+        wants them (`use_qc_filter`).
+
+        What a candidate is scored alongside is a method's `region_context`,
+        which names one of `REGION_CONTEXTS`: "additive matrix" scores a cell
+        over what the candidate places in it ("new_trs"), "mse difference" over
+        the whole cell ("conf_trs").
         """
-        if adata is None:
-            adata = self.default_cxg_table(table_name)
-        adata = self.filter_for_scoring(
-            adata,
-            **self.resolve_qc_bounds(
-                min_counts=min_counts, max_counts=max_counts,
-                min_genes=min_genes, min_cells=min_cells,
-            ),
-        )
-        if cats is None or isinstance(cats, str):
-            cats = self.infer_cats(adata, column=cats)
-
-        all_avg = np.average(adata.X, axis=0)
-
-        # Each type's rows are taken by index off the matrix. Subsetting the
-        # AnnData and deep-copying the result, as this used to, duplicates the
-        # whole expression matrix once per cell type to compute one mean of it.
-        X = adata.X
-        avgs = {}
-        counts = {}
-        for k, v in cats.items():
-            column = adata.obs[k].to_numpy()
-            for cat in v:
-                rows = np.flatnonzero(column == cat)
-                if not len(rows):
-                    # the QC bounds can empty a type out; averaging nothing
-                    # would put nan across its whole row
-                    self.logger.info(
-                        f"[{datetime.now()}] no cells left of type {cat!r} after "
-                        "filtering, so it is left out of the scoring matrix."
-                    )
-                    continue
-                avgs[cat] = np.average(X[rows], axis=0)
-                counts[cat] = len(rows)
-
-        avgs["other"] = all_avg
-        counts["other"] = len(adata)
-
-        df_avg = pd.DataFrame.from_dict(avgs, orient="index", columns=adata.var.index)
-        if normed:
-            norm_total = sum(counts.values())
-            df_normed = df_avg.multiply(
-                [(norm_total - n) / norm_total * 100 for n in counts.values()],
-                axis=0,
+        if not issubclass(SCORING_METHODS.get(method, object), CellTypeScoring):
+            raise KeyError(
+                f"get_scoring_matrix builds a cell-type reference, and {method!r} "
+                "is not a cell-type scoring method. Use set_scoring_method() and "
+                "prepare_scoring() for any other."
             )
+        self.set_scoring_method(
+            method, cats=cats, table_name=table_name, normed=normed,
+        )
+        # the QC bounds go to the assigner, which owns the filtering, not to the
+        # method, which only declares that it wants it
+        return self.prepare_scoring(
+            adata=adata, save=save, table_name=table_name,
+            min_counts=min_counts, max_counts=max_counts,
+            min_genes=min_genes, min_cells=min_cells,
+        )
 
-            df_comp = df_normed
-        else:
-            df_comp = df_avg
+    def score_tr_assignment(self, assignment, context=None):
+        """Score one candidate assignment through the current scoring method.
 
-        self.score_mat = df_comp.fillna(0).to_dict()
-
-        # generating cell_to_type dict, while we have our hands on cats
-        # Written a type at a time rather than a cell at a time: `iterrows`
-        # builds a Series per cell, which on a real table is most of the cost.
-        # A cell matching more than one entry still ends up with the last one,
-        # since the loops run in the same order.
-        self.cell_to_type = {}  # key: cell ID, value: cell type
-        self.tr_to_gene = {}  # key: transcript ID, value: gene name
-        names = adata.obs_names.to_numpy()
-        for key_type, cell_types in cats.items():
-            column = adata.obs[key_type].to_numpy()
-            for cell_type in cell_types:
-                if cell_type not in avgs:
-                    continue  # filtered out entirely, so it scores nothing
-                for name in names[column == cell_type]:
-                    self.cell_to_type[name] = cell_type
-
-        # kept in the sdata so a later assigner over the same store can read the
-        # cell types back rather than having to be handed them again
-        self.save_cell_to_type(save=save)
-
-    def score_tr_assignment(self, assignment, mse_score=False):
-        score = 0
-        for cell, trs in assignment.items():
-            # it's possible to have untyped cells in a comparison
-            # if it is untyped, treat it as an "average" cell.
-            if cell in self.cell_to_type.keys():
-                cell_type = self.cell_to_type[cell]
-            else:
-                cell_type = "other"
-
-            if mse_score:
-                genes = [self.tr_to_gene[tr] for tr in trs]
-                gene_tallies = Counter(genes)
-                for gene in self.score_mat.keys():
-                    if gene in gene_tallies:
-                        score += (
-                            self.score_mat[gene][cell_type] - gene_tallies[gene]
-                        ) ** 2
-                    else:
-                        score += self.score_mat[gene][cell_type] ** 2
-
-                # we want higher score = better, so invert the scale
-                score = score * -1
-            else:
-                for tr in trs:
-                    # there may be genes that do not contribute to score
-                    # (ie: blanks)
-                    # TODO: add optional holdout feature here?
-                    gene = self.tr_to_gene[tr]
-                    if gene in self.score_mat.keys():
-                        score += self.score_mat[gene][cell_type]
-        return score
+        assignment (dict): `{cell: [transcript id, ...]}`.
+        context: the per-region precompute from `ScoringMethod.region_context`,
+            when there is one. The resolve loop always has one; a one-off call
+            can leave it out, which costs a little and changes nothing.
+        """
+        return self.require_scorer().score(assignment, context)
 
     def score_dataset(self, adata, include_other=True):
         """
@@ -2616,14 +3185,12 @@ class SoftAssigner:
                     # throw out this comparison if we don't have a type for
                     # all cells present and we are not explicitly treating them
                     # as "other"
-                    if not use_other_cells and any(
-                        [
-                            (
-                                cell not in self.cell_to_type.keys()
-                                or self.cell_to_type[cell] == "Unassigned"
-                            )
-                            for cell in unconf_tup
-                        ]
+                    # use_other_cells lets an unlabelled cell be compared, against
+                    # the "other" row; never one the scoring table's QC dropped
+                    untyped = [c for c in unconf_tup if c not in self.cell_to_type]
+                    if untyped and (
+                        not use_other_cells
+                        or any(c in self.qc_excluded_cells for c in untyped)
                     ):
                         skip_cached.append(unconf_tup)
                         seg_is_default[unconf_tup] = True
@@ -2634,17 +3201,12 @@ class SoftAssigner:
 
                     # we only care about this unconf_tup comparison
                     # if there are at least 2 different celltypes present
-                    # AND it is not a single cell's unconfident transcripts
+                    # AND it is not a single cell's unconfident transcripts.
+                    # Untyped cells -- only still here under use_other_cells --
+                    # count as one group of their own (None), which is how
+                    # they are scored: all against the "other" row.
                     if (
-                        len(
-                            set(
-                                [
-                                    self.cell_to_type[cell]
-                                    for cell in unconf_tup
-                                    if cell in self.cell_to_type.keys()
-                                ]
-                            )
-                        )
+                        len({self.cell_to_type.get(cell) for cell in unconf_tup})
                         < 2
                     ):
                         if len(unconf_tup) == 1 and use_other_cells:
@@ -2706,9 +3268,7 @@ class SoftAssigner:
         self,
         state,
         default_thresh=5,
-        use_conf_trs=False,
         use_other_cells=False,
-        use_mse_score=False,
         disable_tqdm=False,
     ):
         """Choose each ambiguous region's best assignment, given a scan.
@@ -2727,13 +3287,8 @@ class SoftAssigner:
         state (dict): from `scan_overlapping_regions`.
         default_thresh (float): new segmentation must out-score original segmentation
             by a factor of this much in order to be considered "better".
-        use_conf_trs (bool): If true, confident transcripts will be added to each cell
-            when scoring transcript assignments. If false, only ambiguous transcripts will
-            be used. NOTE: Setting this to True causes a non-trivial slowdown.
         use_other_cells (bool): if True, a one-cell region is compared against a
             notional "other" cell rather than kept as-is.
-        use_mse_score (bool): if True, score an assignment by its squared error
-            against the cell type's expected profile instead of by summed score.
         disable_tqdm (bool): if True, this method will not print output or create
             its own pbar entities.
 
@@ -2742,6 +3297,7 @@ class SoftAssigner:
            seg_is_default: dict of region tuple -> True where the original
               segmentation was kept
         """
+        scorer = self.require_scorer()
         f = state["fov"]
         tr = state["tr"]
         conf_trs = state["conf_trs"]
@@ -2756,7 +3312,6 @@ class SoftAssigner:
             pbar = tqdm(total=len(unconf_trs))
         else:
             pbar = None
-
 
         # start with one way comparisons, then work our way up
         for cur_len in range(1, max_len + 1):
@@ -2774,18 +3329,22 @@ class SoftAssigner:
 
                 elg_cells = list(unconf_tup)
 
+                # Everything already settled in these cells is the same for
+                # every candidate of this region, so the context is built once
+                # here rather than per candidate. Which context -- nothing, or
+                # the settled transcripts -- is the scoring method's declaration
+                # to make, and the contexts themselves are `REGION_CONTEXTS`.
+                context = self.build_region_context(
+                    elg_cells
+                    + (["other"] if use_other_cells and cur_len == 1 else []),
+                    conf_trs,
+                    assigned_trs,
+                )
+
                 # coming up with "default" score for comparison
                 best_score = np.inf * -1
                 best_assignment = self.trs_at_default(tr_by_cell)
-                if use_conf_trs:
-                    best_assignment = self.dict_merge(
-                        best_assignment, conf_trs, elg_cells
-                    )
-                    best_assignment = self.dict_merge(
-                        best_assignment, assigned_trs, elg_cells
-                    )
-
-                default_score = self.score_tr_assignment(best_assignment, use_mse_score)
+                default_score = scorer.score(best_assignment, context)
 
                 # handle this more simply if we only have one transcript in this region
                 total_trs = sum([len(trs) for trs in tr_by_cell.values()]) / 2
@@ -2793,7 +3352,7 @@ class SoftAssigner:
                     # manually run this one trascript though all eligible cells
                     for cell in tr_by_cell.keys():
                         assignment = {cell: [tr_by_cell[cell][0, 0]]}
-                        score = self.score_tr_assignment(assignment, use_mse_score)
+                        score = scorer.score(assignment, context)
                         if (
                             score > best_score
                             and score > default_score * default_thresh
@@ -2853,15 +3412,7 @@ class SoftAssigner:
                                 )
                                 break
 
-                            if use_conf_trs:
-                                assignment = self.dict_merge(
-                                    assignment, conf_trs, elg_cells
-                                )
-                                assignment = self.dict_merge(
-                                    assignment, assigned_trs, elg_cells
-                                )
-
-                            score = self.score_tr_assignment(assignment, use_mse_score)
+                            score = scorer.score(assignment, context)
                             if (
                                 score > best_score
                                 and score > default_score * default_thresh
@@ -2880,31 +3431,19 @@ class SoftAssigner:
 
                 seg_is_default[unconf_tup] = bool(best_score == -1)
 
+                # The winning candidate holds only this region's ambiguous
+                # transcripts whatever the scoring method was given -- the
+                # settled ones ride in the region context, not in the candidate
+                # -- so they are simply recorded. This used to have to subtract
+                # the merged-in transcripts back out under a conf_trs context, and
+                # dropped a cell's new transcripts entirely when that cell held
+                # none to subtract.
                 for cell, trs in best_assignment.items():
                     if len(trs) > 0 and cell != "other":
-                        if not use_conf_trs:
-                            if cell in assigned_trs.keys():
-                                assigned_trs[cell].extend([float(t) for t in trs])
-                            else:
-                                assigned_trs[cell] = [float(t) for t in trs]
+                        if cell in assigned_trs.keys():
+                            assigned_trs[cell].extend([float(t) for t in trs])
                         else:
-                            # if we are using the conf assignments, we need to remove them from the assignment pool.
-                            actual_trs = []
-                            already_used = self.dict_merge(
-                                conf_trs, assigned_trs, [cell]
-                            )
-                            if cell not in already_used.keys():
-                                continue
-                            already_used = already_used[cell]
-                            for t in trs:
-                                if t not in already_used:
-                                    actual_trs.append(t)
-                            if cell in assigned_trs.keys():
-                                assigned_trs[cell].extend(
-                                    [float(t) for t in actual_trs]
-                                )
-                            else:
-                                assigned_trs[cell] = [float(t) for t in actual_trs]
+                            assigned_trs[cell] = [float(t) for t in trs]
         # print([k for k in unconf_trs.keys()])
 
         if pbar is not None:
@@ -2934,7 +3473,6 @@ class SoftAssigner:
                 else:
                     print(f"{unconf_tup} does not have corresponding trs list")
 
-
         if pbar is not None:
             pbar.close()
 
@@ -2943,23 +3481,15 @@ class SoftAssigner:
     def evaluate_overlapping_regions_single_fov(
         self,
         f,
-        gene_col_name="gene",
-        min_thresh=0.7,
-        default_thresh=5,
-        only_tagged_cells=None,
-        use_conf_trs=False,
-        use_other_cells=False,
-        use_mse_score=False,
-        assigned_col="assignment",
-        omit_blanks=True,
-        auto_assign_single_target=False,
-        save_delta_tallies=False,
-        disable_tqdm=False,
-        overwrite=False,
-        save=True,
-        recompute_og=False,
-        scan_state=None,
+        params=None,
+        batch=False,
+        save=None,
+        disable_tqdm=None,
         defer_region_tables=False,
+        scan_state=None,
+        scoring_method=None,
+        scoring_params=None,
+        **overrides,
     ):
         """
         Scores and re-assigns border region transcripts for a single FOV.
@@ -2972,49 +3502,36 @@ class SoftAssigner:
         repeating it.
 
         f (int): current FOV
-        gene_col_name (string): the gene/feature column of the transcript table.
-        default_thresh (float): new segmentation must out-score original segmentation
-            by a factor of this much in order to be considered "better".
-        min_thresh (float): threshold to be used for confident transcript identification.
-            Defaults to the value the validated vizgen run used; it is a share of
-            a transcript's total score, so it does not depend on the panel.
-        only_tagged_cells (list): If provided, only cells in this list will be considered for re-evaluation.
-        use_conf_trs (bool): If true, confident transcripts will be added to each cell
-            when scoring transcript assignments. If false, only ambiguous transcripts will
-            be used. NOTE: Setting this to True causes a non-trivial slowdown.
-        assigned_col (string): The name of the column for the new assignment to be added to
-            for a given FOV's transcript table.
-        omit_blanks (bool): if True (the default, as in the validated vizgen run),
-            all blanks will be categorically ignored. Note that you
-            may not want to ignore blanks in cell assignment if you want to quantify
-            any kind of spatial error.
-        auto_assign_single_target (bool): if True, unconfident transcripts that have a single
-            eligible target cell will automatically be assigned to that cell.
-        disable_tqdm (bool): if True, this method will not print output or  create
-            its own pbar entities.
-        overwrite (bool): if True, this method will overwite assigned_col if it already exists.
-        use_other_cells (bool): if True, a region whose cells share one type is
-            still resolved, against a notional "other" cell.
-        use_mse_score (bool): if True, score an assignment by its squared error
-            against the cell type's expected profile instead of by summed score.
-        save_delta_tallies (bool): if True, per-cell gained/lost/changed/final
-            counts are stored as a `f"{fov}_deltas_{assigned_col}"` table.
-        save (bool): if True (default) the transcript table is written back to
-            the store. False leaves the edit in memory, for a caller making many
-            successive assignments -- see `SupportFuncs.ParamSweeper`.
-        recompute_og (bool): og_cell and og_type follow from `cell_ids` and the
-            scoring matrix's cell types, not from either threshold, so an
-            existing pair is reused. `blur_fov` drops them when it rewrites
-            `cell_ids`; set this to rebuild them after changing the cell types
-            under an already-used scoring matrix.
+        params (RegionEvalParams): what to do, as one object. Leave it None and
+            one is built from `overrides`, so every keyword this used to take
+            still works: `evaluate_overlapping_regions_single_fov(f,
+            assigned_col="x", min_thresh=0.8)` reads the same as it always did.
+            See `RegionEvalParams` for the full list.
+        batch (bool): this FOV is one of many being driven by a runner rather
+            than a call someone is watching. It is the pair that was always set
+            together for such a run and never otherwise -- no progress bars or
+            prints, and the FOV's element written, which for a pooled worker is
+            how its result gets back at all. Either half can still be said on
+            its own, below, for the cases that want one and not the other.
+        save (bool): override the writing `batch` implies. None follows it, and
+            both ways round that is True -- an interactive call saves too.
+            False leaves the edit in memory for a caller making many successive
+            assignments, which is `ParamSweeper`: a batch that defers its writes.
+        disable_tqdm (bool): override the quiet `batch` implies. None follows it.
+        defer_region_tables (bool): if True, this FOV's rows for the
+            `assigned_trs`/`seg_is_default` tables are returned instead of being
+            merged into them here. Those tables cover every FOV, so a pooled
+            runner merges them once rather than having each worker rewrite the
+            shared element -- see `evaluate_all_overlapping_regions`. Not part of
+            `batch`: a sweep is a batch that still keeps its own rows.
         scan_state (dict): a scan from `scan_overlapping_regions` to resolve,
             instead of scanning this FOV again. Must have been taken at the same
             `min_thresh`, which is what a scan depends on.
-        defer_region_tables (bool): if True, this FOV's rows for the
-            `assigned_trs`/`seg_is_default` tables are returned instead of being
-            merged into them here. Those tables cover every FOV, so a runner
-            merges them once rather than having each FOV rewrite the element --
-            see `evaluate_all_overlapping_regions`.
+        scoring_method (string): the scoring method to evaluate with, by name.
+            None uses the one already prepared. See `use_scoring`: the method
+            is prepared here if it is not the one in force, and stays in force.
+        scoring_params (dict): that method's parameters, in full.
+        overrides: any field of `RegionEvalParams`, applied over `params`.
 
         writes: `assigned_col`, `og_cell`, `og_type` and `f"{assigned_col}_type"`
            on the FOV's points element, and this FOV's rows of the
@@ -3022,24 +3539,29 @@ class SoftAssigner:
            `f"seg_is_default_{assigned_col}"` tables, which record how those
            assignments were reached. Saved unless `save` is False.
         """
-        if self.has_column(f, assigned_col) and not overwrite:
+        params = RegionEvalParams.build(params, **overrides)
+        # the two things a batch run always wants and an interactive one never
+        # does, from the one flag that says which this is -- each still sayable
+        # on its own for the callers that want one half
+        quiet = batch if disable_tqdm is None else disable_tqdm
+        save = True if save is None else save
+        self._check_scoring_args(scoring_params)
+
+        assigned_col = params.assigned_col
+        if self.has_column(f, assigned_col) and not params.overwrite:
             self.logger.info(
                 f"[{datetime.now()}] skipping fov_{f:0>4}, {assigned_col} already present"
             )
-            if not disable_tqdm:
+            if not quiet:
                 print(f"fov_({f:0>4}) already present, skipping")
             return
+        # after the skip, so a call with nothing to do prepares nothing; before
+        # the scan, which already needs the method's cell types
+        self.use_scoring(scoring_method, scoring_params, save=save)
 
         if scan_state is None:
             scan_state = self.scan_overlapping_regions(
-                f,
-                gene_col_name=gene_col_name,
-                min_thresh=min_thresh,
-                only_tagged_cells=only_tagged_cells,
-                use_other_cells=use_other_cells,
-                omit_blanks=omit_blanks,
-                auto_assign_single_target=auto_assign_single_target,
-                disable_tqdm=disable_tqdm,
+                f, disable_tqdm=quiet, **params.scan_kwargs()
             )
         if scan_state is None:
             return
@@ -3047,18 +3569,19 @@ class SoftAssigner:
         tr = scan_state["tr"]
         conf_trs = scan_state["conf_trs"]
         assigned_trs, seg_is_default = self.resolve_overlapping_regions(
-            scan_state,
-            default_thresh=default_thresh,
-            use_conf_trs=use_conf_trs,
-            use_other_cells=use_other_cells,
-            use_mse_score=use_mse_score,
-            disable_tqdm=disable_tqdm,
+            scan_state, disable_tqdm=quiet, **params.resolve_kwargs()
         )
+        if not defer_region_tables:
+            # how this column was scored, alongside the column itself. Skipped
+            # when the rows are deferred, which is the pooled case: attrs are
+            # one shared file, so several workers writing it would race. The
+            # parent writes it once instead, in evaluate_all_overlapping_regions.
+            self.record_scoring(assigned_col, params, fovs=[f], save=save)
 
         table_rows = self.region_rows(f, assigned_trs, seg_is_default)
         if not defer_region_tables:
             self.save_region_tables(
-                {f: table_rows}, assigned_col, overwrite=overwrite, save=save
+                {f: table_rows}, assigned_col, overwrite=params.overwrite, save=save
             )
 
         self.logger.info(f"[{datetime.now()}] updating tr for fov_{f:0>4}")
@@ -3108,7 +3631,7 @@ class SoftAssigner:
         # alone. `blur_fov` drops them when it rewrites `cell_ids`; pass
         # `recompute_og=True` after changing the cell types under a scoring
         # matrix that has already been used.
-        if recompute_og or "og_cell" not in tr.columns:
+        if params.recompute_og or "og_cell" not in tr.columns:
             og_cell = []
             for raw in tr["cell_ids"].to_numpy():
                 cell = None if raw is None else self.assign_to_cell(parse_cell_ids(raw))
@@ -3119,7 +3642,7 @@ class SoftAssigner:
                 f"fov_{f:0>4}: reusing the og_cell column already on the table."
             )
 
-        if recompute_og or "og_type" not in tr.columns:
+        if params.recompute_og or "og_type" not in tr.columns:
             tr["og_type"] = self.as_label_column(
                 tr["og_cell"].map(self.cell_to_type), tr.index
             )
@@ -3129,7 +3652,7 @@ class SoftAssigner:
         )
 
         # tally deltas while the table is still addressed by transcript id
-        if save_delta_tallies:
+        if params.save_delta_tallies:
             deltas = {}
             final_trs = {}
             # compared as a plain object array: `assigned_col` is nullable, and
@@ -3281,6 +3804,9 @@ class SoftAssigner:
         """
         if processes > 1:
             self._check_parallel_allowed()
+            # workers each save their own element, and the first of a kind to be
+            # written creates its group; several doing that at once collide
+            SpatialDataHelpers.ensure_element_groups(self.sdata)
 
         results = []
         with tqdm(total=total) as pbar:
@@ -3299,39 +3825,36 @@ class SoftAssigner:
         self._reload_sdata()
         return results
 
-    def evaluate_all_overlapping_regions(
-        self,
-        sel_fovs=None,
-        gene_col_name="gene",
-        min_thresh=0.7,
-        default_thresh=5,
-        only_tagged_cells=None,
-        use_conf_trs=False,
-        use_other_cells=False,
-        use_mse_score=False,
-        assigned_col="assignment",
-        omit_blanks=True,
-        auto_assign_single_target=False,
-        save_delta_tallies=False,
-        overwrite=False,
-        recompute_og=False,
-    ):
+    def evaluate_all_overlapping_regions(self, sel_fovs=None, params=None,
+                                         scoring_method=None, scoring_params=None,
+                                         **overrides):
         """
         Runner for evaluate_overlapping_regions_single_fov.
         Runs said method in parallel on multiple fovs.
 
-        Every argument bar `sel_fovs` is passed straight through; see that
-        method for what each does. Each worker scans and resolves its own FOV
-        and saves its own element, so this always writes -- the deferred `save`
-        that a sweep uses is not available here. The `assigned_trs` and
-        `seg_is_default` tables cover every FOV at once, so they are merged and
-        written here, after the workers have finished.
+        Every FOV runs with `batch=True`: quiet, and saving its own element.
+        Neither is optional here -- saving its own element is how a worker
+        returns its result at all, so the deferred `save` a sweep uses is not
+        available. The `assigned_trs` and `seg_is_default` tables cover every FOV
+        at once, so each worker hands its rows back (`defer_region_tables`) and
+        they are merged and written here, after the pool has finished.
 
         sel_fovs (list): FOVs to run on. Defaults to every FOV whose transcript
            table has been through `blur_fov`.
-        recompute_og (bool): rebuild og_cell/og_type rather than reusing an
-           existing pair.
+        params (RegionEvalParams): what to do, as one object; None builds one
+           from `overrides`, so every keyword this used to take still works.
+        scoring_method (string): the scoring method to evaluate with, by name;
+           None uses the one already prepared. Prepared here, once, before any
+           worker starts -- each worker is handed the prepared method -- and in
+           force afterwards. See `use_scoring`.
+        scoring_params (dict): that method's parameters, in full.
+        overrides: any field of `RegionEvalParams` -- `min_thresh`,
+           `assigned_col`, `overwrite`, `recompute_og` and the rest.
         """
+        params = RegionEvalParams.build(params, **overrides)
+        self._check_scoring_args(scoring_params)
+        self.use_scoring(scoring_method, scoring_params)
+        assigned_col = params.assigned_col
         if sel_fovs is None:
             sel_fovs = self.get_complete_fovs()
 
@@ -3349,33 +3872,28 @@ class SoftAssigner:
 
         results = []
         for subset_fovs in fov_pool:
-            self.logger.info(f"[{datetime.now()}] starting sub-pool: {subset_fovs}")
+            self.logger.info(
+                f"[{datetime.now()}] starting sub-pool: {subset_fovs}"
+            )
             results.extend(self._run_over_fovs(
                 zip(
-                    repeat(SoftAssigner.evaluate_overlapping_regions_single_fov),
+                    repeat(
+                        SoftAssigner.evaluate_overlapping_regions_single_fov
+                    ),
                     subset_fovs,
-                    repeat(gene_col_name),
-                    repeat(min_thresh),
-                    repeat(default_thresh),
-                    repeat(only_tagged_cells),
-                    repeat(use_conf_trs),
-                    repeat(use_other_cells),
-                    repeat(use_mse_score),
-                    repeat(assigned_col),
-                    repeat(omit_blanks),
-                    repeat(auto_assign_single_target),
-                    repeat(save_delta_tallies),
-                    repeat(True),
-                    repeat(overwrite),
-                    repeat(True),  # save: each worker persists its own element
-                    repeat(recompute_og),
-                    repeat(None),  # scan_state: each worker scans its own FOV
+                    repeat(params),
+                    repeat(True),  # batch: quiet, saves its own element
+                    repeat(None),  # save: as batch has it
+                    repeat(None),  # disable_tqdm: as batch has it
                     repeat(True),  # defer_region_tables: merged below, once
                 ),
                 len(subset_fovs),
                 min(self.pool_size, len(subset_fovs)),
                 collect=True,
             ))
+        # the scoring that produced the column, written once here for the
+        # same reason the tables below are: attrs is a single shared file
+        self.record_scoring(assigned_col, params, fovs=sel_fovs)
 
         # the assigned_trs/seg_is_default tables span every FOV, so they are
         # written here rather than by each FOV: a worker holds its own copy of
@@ -3383,7 +3901,7 @@ class SoftAssigner:
         # whichever finished last. FOVs that were skipped return nothing.
         rows = {f: (trs, seg) for f, trs, seg in (r for r in results if r is not None)}
         if rows:
-            self.save_region_tables(rows, assigned_col, overwrite=overwrite)
+            self.save_region_tables(rows, assigned_col, overwrite=params.overwrite)
 
     def combined_changed_transcripts(
         self, assigned_col="assignment", gene_col_name="gene"

@@ -28,7 +28,9 @@ import os
 import re
 import threading
 import warnings
+from collections.abc import ItemsView, KeysView, ValuesView
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Union
 
 import anndata as ad
@@ -37,8 +39,12 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 from shapely.geometry import MultiPolygon, Polygon
-from spatialdata import SpatialData
+from spatialdata import SpatialData, read_zarr
 from spatialdata import aggregate as _sd_aggregate
+
+# spatialdata's element containers, subclassed by `open_store` to read shapes and
+# tables on demand. Not public API; spatialdata 0.7 is what this was built on.
+from spatialdata._core._elements import Shapes, Tables
 from spatialdata.models import PointsModel, ShapesModel
 from spatialdata.transformations import Affine, Identity, get_transformation
 
@@ -99,6 +105,221 @@ class SpatialDataHelpers:
         drop_no_parent._softseg_filter = True
         logger.addFilter(drop_no_parent)
 
+    # Element groups `read_zarr` reads in full rather than lazily. Images,
+    # labels and points come back as dask, so opening them costs little; a
+    # shapes element is a GeoDataFrame and a table an AnnData, both read whole.
+    # On one real store that was 9 GB of shapes and 11 GB of tables -- one
+    # 38M-row bookkeeping table alone was 7.5 GB -- before anything had been
+    # asked of it.
+    ON_DEMAND_GROUPS = ("shapes", "tables")
+
+    class _OnDemand:
+        """Mixin for spatialdata's `Shapes`/`Tables`: elements read on first use.
+
+        The names of everything in the store are known from the start, so
+        `in`, iteration, `keys()` and `len()` answer as if every element were
+        loaded, and `[name]` reads the one asked for. Reading by name is the
+        cheap path, and the one this package uses.
+
+        `values()` and `items()` keep dict semantics and read everything --
+        except inside `loaded_only`, which this package wraps around the
+        spatialdata calls that walk every element in passing (writing or
+        deleting one, which every save does). Those only ever need what is in
+        memory, and without it each save would read the whole store.
+        """
+
+        def _init_on_demand(self, pending, reader):
+            self._pending = dict(pending)  # name -> its path in the store
+            self._from_disk = {}  # loaded, and unchanged since: name -> path
+            self._reader = reader
+            self._loaded_only = 0
+            for name in self._pending:
+                self._add_shared_key(name)
+
+        def __missing__(self, key):
+            # UserDict.__getitem__ calls this for a key not in `data`.
+            if key not in self._pending:
+                raise KeyError(key)
+            path = self._pending[key]
+            element = self._reader(path)
+            del self._pending[key]
+            self.data[key] = element
+            self._from_disk[key] = path
+            return element
+
+        def __contains__(self, key):
+            return key in self.data or key in self._pending
+
+        def __iter__(self):
+            yield from list(self.data)
+            yield from [k for k in list(self._pending) if k not in self.data]
+
+        def __len__(self):
+            return len(self.data) + len(self._pending)
+
+        def keys(self):
+            return KeysView(self)
+
+        def values(self):
+            return self.data.values() if self._loaded_only else ValuesView(self)
+
+        def items(self):
+            return self.data.items() if self._loaded_only else ItemsView(self)
+
+        def __setitem__(self, key, value):
+            super().__setitem__(key, value)
+            self._pending.pop(key, None)
+            self._from_disk.pop(key, None)  # no longer what the store holds
+
+        def __delitem__(self, key):
+            if key in self._pending and key not in self.data:
+                del self._pending[key]
+                self._remove_shared_key(key)
+                return
+            super().__delitem__(key)
+            self._from_disk.pop(key, None)
+
+        def release(self, key):
+            """Drop a loaded element from memory, to be re-read when next asked.
+
+            Only an element read from the store and not replaced since: anything
+            else exists nowhere but in memory, and dropping it would lose it.
+            Returns whether it was dropped.
+            """
+            if key not in self._from_disk or key not in self.data:
+                return False
+            self._pending[key] = self._from_disk.pop(key)
+            del self.data[key]
+            return True
+
+    class _OnDemandShapes(_OnDemand, Shapes):
+        pass
+
+    class _OnDemandTables(_OnDemand, Tables):
+        pass
+
+    @staticmethod
+    def open_store(path) -> SpatialData:
+        """Open a store with its shapes and tables read only when asked for.
+
+        What `spatialdata.read_zarr(path)` returns, except that the groups in
+        `ON_DEMAND_GROUPS` are read an element at a time on first access by
+        name (`sdata.tables["cxg"]`) rather than all at once. Opening the store
+        then costs what the lazy groups cost -- seconds, and a few hundred MB --
+        whatever it holds.
+
+        Note that `sdata["name"]`, `"name" in sdata` and `print(sdata)` go
+        through every element and so still read them all; `sdata.tables[...]`
+        and `sdata.shapes[...]` are the ways in that do not.
+        """
+        import zarr
+        from spatialdata._io.io_shapes import _read_shapes
+        from spatialdata._io.io_table import _read_table
+
+        SpatialDataHelpers.quiet_ome_zarr()
+        lazy = SpatialDataHelpers.ON_DEMAND_GROUPS
+        eager = tuple(
+            g for g in ("images", "labels", "points", "shapes", "tables")
+            if g not in lazy
+        )
+        sdata = read_zarr(Path(path), selection=eager)
+
+        root = zarr.open_group(str(path), mode="r")
+        groups = {
+            "shapes": (SpatialDataHelpers._OnDemandShapes, _read_shapes),
+            "tables": (SpatialDataHelpers._OnDemandTables, _read_table),
+        }
+        for group, (cls, reader) in groups.items():
+            names = []
+            if group in root:
+                names = [n for n in root[group] if not Path(n).name.startswith(".")]
+            pending = {n: os.path.join(str(path), group, n) for n in names}
+            container = cls(shared_keys=sdata._shared_keys)
+            container._init_on_demand(pending, reader)
+            setattr(sdata, f"_{group}", container)
+        return sdata
+
+    ELEMENT_GROUPS = ("images", "labels", "points", "shapes", "tables")
+
+    @staticmethod
+    def ensure_element_groups(sdata: SpatialData) -> list:
+        """Create any of the store's top-level element groups that are missing.
+
+        spatialdata creates `shapes/`, `tables/` and the rest on the first write
+        of that kind, by checking for the group and then creating it. Two worker
+        processes doing their first write of a kind at once both find it absent,
+        and the second to create it fails with `ContainsGroupError` -- which is
+        what a pooled blur over a store with no shapes yet does. Creating them up
+        front, in the parent and before the pool, leaves the workers nothing to
+        race over. Returns the groups created; a no-op for an unbacked object.
+        """
+        if not sdata.is_backed() or sdata.path is None:
+            return []
+        import zarr
+
+        root = zarr.open_group(str(sdata.path), mode="r+", use_consolidated=False)
+        created = [g for g in SpatialDataHelpers.ELEMENT_GROUPS if g not in root]
+        for group in created:
+            root.require_group(group)
+        if created and sdata.has_consolidated_metadata():
+            sdata.write_consolidated_metadata()
+        return created
+
+    @staticmethod
+    @contextmanager
+    def loaded_only(sdata: SpatialData):
+        """Have spatialdata's own sweeps over elements see only loaded ones.
+
+        For the duration, `values()`/`items()` of an on-demand group yield what
+        is in memory and read nothing. A no-op for an object `open_store` did
+        not open.
+        """
+        groups = [
+            getattr(sdata, f"_{name}", None)
+            for name in SpatialDataHelpers.ON_DEMAND_GROUPS
+        ]
+        groups = [g for g in groups if isinstance(g, SpatialDataHelpers._OnDemand)]
+        for g in groups:
+            g._loaded_only += 1
+        try:
+            yield
+        finally:
+            for g in groups:
+                g._loaded_only -= 1
+
+    @staticmethod
+    def release_element(sdata: SpatialData, name: str) -> bool:
+        """Drop an unchanged element read from the store, so memory stays bounded.
+
+        Re-read on the next access. Does nothing (returning False) for an
+        element that was never read from the store or has been replaced since,
+        or for an object `open_store` did not open.
+        """
+        for group_name in SpatialDataHelpers.ON_DEMAND_GROUPS:
+            group = getattr(sdata, f"_{group_name}", None)
+            if isinstance(group, SpatialDataHelpers._OnDemand) and name in group:
+                return group.release(name)
+        return False
+
+    @staticmethod
+    def table_obs(sdata: SpatialData, name: str) -> pd.DataFrame:
+        """A table's `obs` alone, without reading the rest of it when avoidable.
+
+        A table `open_store` has not yet read is read for its `obs` group only --
+        the cell types of a cell-by-gene table without its dense matrix. One
+        already in memory is simply handed back.
+        """
+        group = getattr(sdata, "_tables", None)
+        if (
+            isinstance(group, SpatialDataHelpers._OnDemand)
+            and name in group._pending
+        ):
+            import zarr
+
+            store = zarr.open_group(group._pending[name], mode="r")
+            return ad.io.read_elem(store["obs"])
+        return sdata.tables[name].obs
+
     @staticmethod
     def _element_fov_cs(element) -> Optional[str]:
         """The element's own FOV coordinate system, read off the element itself.
@@ -138,12 +359,19 @@ class SpatialDataHelpers:
         """
         if not sdata.is_backed():
             return False
-        try:
-            sdata.delete_element_from_disk(name)
-        except (ValueError, KeyError):
-            pass  # not on disk yet: this is the element's first write
-        with SpatialDataHelpers._write_settings():
-            sdata.write_element(name)
+        # An on-demand element nobody has asked for yet is read first, since it
+        # is what gets written; everything else is left on disk, which is what
+        # `loaded_only` keeps spatialdata's own sweeps over elements to.
+        for group in (sdata.shapes, sdata.tables):
+            if name in group:
+                group[name]
+        with SpatialDataHelpers.loaded_only(sdata):
+            try:
+                sdata.delete_element_from_disk(name)
+            except (ValueError, KeyError):
+                pass  # not on disk yet: this is the element's first write
+            with SpatialDataHelpers._write_settings():
+                sdata.write_element(name)
         return True
 
     # anndata's `auto_shard_zarr_v3` is tri-state: left as None it warns on every
@@ -191,10 +419,11 @@ class SpatialDataHelpers:
             return False
 
         if sdata.is_backed():
-            try:
-                sdata.delete_element_from_disk(name)
-            except (ValueError, KeyError):
-                pass  # it was never written
+            with SpatialDataHelpers.loaded_only(sdata):
+                try:
+                    sdata.delete_element_from_disk(name)
+                except (ValueError, KeyError):
+                    pass  # it was never written
         return True
 
     # ----------------------------------------------------------------------- #
